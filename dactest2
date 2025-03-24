@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+import spidev
+import time
+import RPi.GPIO as GPIO
+
+# Setup the LOAD pin (adjust the pin number as needed)
+LOAD_PIN = 17
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LOAD_PIN, GPIO.OUT, initial=GPIO.HIGH)
+
+def pulse_load():
+    """Pulse the LOAD pin low for 1 µs, which is an acceptable compromise given Python's timing limits."""
+    GPIO.output(LOAD_PIN, GPIO.LOW)
+    time.sleep(1e-6)  # 1 µs pulse
+    GPIO.output(LOAD_PIN, GPIO.HIGH)
+
+def update_dac(spi, value, range_bit=0, channel=0):
+    """
+    Update a single DAC channel on the TLC5620C.
+    
+    The 11-bit command word comprises:
+      - Bits 10-9: DAC channel select (A1, A0)
+      - Bit 8: Range bit (RNG)
+      - Bits 7-0: 8-bit data (D7-D0)
+      
+    The command is left-shifted by 5 to form a 16-bit word, then transmitted over SPI.
+    """
+    if channel not in [0, 1, 2, 3]:
+        raise ValueError("Channel must be 0, 1, 2, or 3")
+    if not (0 <= value <= 255):
+        raise ValueError("Value must be between 0 and 255")
+    if range_bit not in [0, 1]:
+        raise ValueError("Range bit must be 0 or 1")
+    
+    # Construct the 11-bit command
+    command_11 = (channel << 9) | (range_bit << 8) | value
+    # Left-shift by 5 to form the 16-bit command word
+    command_word = command_11 << 5
+
+    # Split the 16-bit word into two bytes (big-endian)
+    high_byte = (command_word >> 8) & 0xFF
+    low_byte = command_word & 0xFF
+
+    # Transmit the two bytes over SPI
+    spi.writebytes([high_byte, low_byte])
+
+    # Latch the data by pulsing the LOAD pin
+    pulse_load()
+
+    print(f"Channel {channel} set to value {value} -> Data: {high_byte:02X} {low_byte:02X}")
+
+def main():
+    # Open the SPI device on bus 0, device 0
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    spi.max_speed_hz = 5000000  # 5 MHz SPI clock
+    spi.mode = 0              # SPI mode 0
+
+    try:
+        print("Updating DAC continuously. Press CTRL+C to stop.")
+        value = 0
+        direction = 1  # Increment direction
+
+        while True:
+            update_dac(spi, value, range_bit=0, channel=0)
+            time.sleep(0.1)  # Adjust delay as needed
+            value += direction
+            if value >= 255:
+                direction = -1
+            elif value <= 0:
+                direction = 1
+    except KeyboardInterrupt:
+        print("Terminating DAC update.")
+    finally:
+        spi.close()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
