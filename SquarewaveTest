@@ -1,0 +1,18 @@
+import RPi.GPIO as GPIO
+import time
+
+GPIO.setmode(GPIO.BCM)
+test_pin = 21  # Use a free GPIO pin for this test
+GPIO.setup(test_pin, GPIO.OUT)
+
+print("Generating a square wave on GPIO", test_pin)
+try:
+    while True:
+        GPIO.output(test_pin, GPIO.HIGH)
+        time.sleep(0.5)  # High for 0.5 seconds
+        GPIO.output(test_pin, GPIO.LOW)
+        time.sleep(0.5)  # Low for 0.5 seconds
+except KeyboardInterrupt:
+    print("Test stopped.")
+finally:
+    GPIO.cleanup()
