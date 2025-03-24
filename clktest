@@ -1,0 +1,20 @@
+import spidev
+import time
+
+# Open SPI device on bus 0, device 0
+spi = spidev.SpiDev()
+spi.open(0, 0)
+
+# Set a lower clock speed for easier observation (500 kHz)
+spi.max_speed_hz = 500000  # 500 kHz
+
+print("Transmitting dummy data to generate SPI clock pulses on GPIO 11 (SCLK)...")
+try:
+    while True:
+        # Sending a fixed dummy byte (0xAA gives a nice pattern: 10101010)
+        spi.writebytes([0xAA])
+        time.sleep(0.5)  # pause so you can observe the clock pulse burst
+except KeyboardInterrupt:
+    print("Test stopped by user.")
+finally:
+    spi.close()
