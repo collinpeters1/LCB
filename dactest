@@ -1,0 +1,71 @@
+import spidev
+import time
+import RPi.GPIO as GPIO
+
+# GPIO setup for the LOAD pin (adjust the pin number as needed)
+LOAD_PIN = 17
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LOAD_PIN, GPIO.OUT, initial=GPIO.HIGH)
+
+def pulse_load():
+    """Pulse the LOAD pin low briefly to latch the DAC data."""
+    GPIO.output(LOAD_PIN, GPIO.LOW)
+    time.sleep(0.000001)  # 1 microsecond pulse; adjust if necessary
+    GPIO.output(LOAD_PIN, GPIO.HIGH)
+
+def update_dac(value, range_bit=0, channel=0):
+    """
+    Update a single DAC channel on the TLC5620C.
+    
+    The command format (11 bits) is:
+      - Bits 10-9: DAC channel select bits (A1, A0)
+      - Bit 8: Range bit (RNG)
+      - Bits 7-0: 8-bit data (D7-D0)
+    
+    The 11-bit command is left-shifted by 5 to create a 16-bit word.
+    """
+    if channel not in [0, 1, 2, 3]:
+        raise ValueError("Channel must be 0, 1, 2, or 3")
+    if not (0 <= value <= 255):
+        raise ValueError("Value must be between 0 and 255")
+    if range_bit not in [0, 1]:
+        raise ValueError("Range bit must be 0 or 1")
+    
+    # Construct the 11-bit command: A1-A0 (bits 10-9), RNG (bit 8), then data (bits 7-0)
+    command_11 = (channel << 9) | (range_bit << 8) | value
+    command_word = command_11 << 5  # Align into a 16-bit word
+
+    # Split the 16-bit command into two bytes (big-endian)
+    high_byte = (command_word >> 8) & 0xFF
+    low_byte = command_word & 0xFF
+
+    # Open the SPI device, send the bytes, and close the connection
+    spi = spidev.SpiDev()
+    spi.open(0, 0)           # Bus 0, Device 0
+    spi.max_speed_hz = 5000000 # 5 MHz
+    spi.writebytes([high_byte, low_byte])
+    spi.close()
+
+    # Latch the data by pulsing the LOAD pin
+    pulse_load()
+    print(f"Channel {channel} set to value {value} (range_bit={range_bit})")
+
+if __name__ == "__main__":
+    try:
+        print("Starting single-channel DAC test on channel 0...")
+
+        # Fixed mid-scale test
+        print("Setting channel 0 to mid-scale value (128)...")
+        update_dac(128, range_bit=0, channel=0)
+        time.sleep(2)  # Pause to observe the output
+
+        # Ramp test: increase from 0 to 255 and then decrease back to 0
+        print("Performing ramp test on channel 0...")
+        for val in range(0, 256, 5):
+            update_dac(val, range_bit=0, channel=0)
+            time.sleep(0.1)
+        for val in range(255, -1, -5):
+            update_dac(val, range_bit=0, channel=0)
+            time.sleep(0.1)
+    finally:
+        GPIO.cleanup()
