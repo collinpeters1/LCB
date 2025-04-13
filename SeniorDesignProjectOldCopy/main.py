@@ -85,11 +85,11 @@ def main():
             cv2.putText(analysis_img, f"S11: {dark_S11:.1f}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.putText(analysis_img, f"S21: {dark_S21:.1f}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.putText(analysis_img, f"S31: {dark_S31:.1f}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            cv2.putText(analysis_img, f"HS11: {dac_HS11}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            cv2.putText(analysis_img, f"HS21: {dac_HS21}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            cv2.putText(analysis_img, f"HF1:  {dac_HF1}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            cv2.putText(analysis_img, f"LS1:  {dac_LS1}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            cv2.putText(analysis_img, f"LF1:  {dac_LF1}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(analysis_img, f"HS11: {dac_HS11}", (200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(analysis_img, f"HS21: {dac_HS21}", (200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(analysis_img, f"HF1:  {dac_HF1}", (200, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(analysis_img, f"LS1:  {dac_LS1}", (200, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(analysis_img, f"LF1:  {dac_LF1}", (200, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             
             cv2.imshow("Analysis (C270)", analysis_img)
             
@@ -103,17 +103,8 @@ def main():
             current_status = ups_data.get("ups.status", "Unknown")
             current_charge = ups_data.get("battery.charge", "Unknown")
             current_runtime = ups_data.get("battery.runtime", "Unknown")
-        # Format runtime from seconds to HH:MM:SS
-            runtime_sec = int(current_runtime) if str(current_runtime).isdigit() else 0
-            hours = runtime_sec // 3600
-            minutes = (runtime_sec % 3600) // 60
-            seconds = runtime_sec % 60
-            formatted_runtime = f"{hours:02}:{minutes:02}:{seconds:02}"
-
-        # Multi-line overlay text
-            cv2.putText(hdr_frame, f"UPS Status: {current_status}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(hdr_frame, f"Charge: {current_charge}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(hdr_frame, f"Runtime: {formatted_runtime}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            overlay_text = f"UPS: {current_status}  Charge: {current_charge}%  Runtime: {current_runtime}s"
+            cv2.putText(hdr_frame, overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
             cv2.imshow("HDR Feed (IMX708)", hdr_frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):

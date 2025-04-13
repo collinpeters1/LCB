@@ -60,16 +60,16 @@ class LightingAnalyzer:
                 darkness = 100 - ((cell_dark / cell_total) * 100)
                 cell_darkness.append(darkness)
                 text = f'{darkness:.1f}%'
-                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
+                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 text_width, text_height = text_size
                 center_x = start_x + (cell_width - text_width) // 2
                 center_y = start_y + (cell_height + text_height) // 2
                 cv2.putText(annotated_img, text, (center_x, center_y), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 155, 255), 3)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         for r in range(1, self.rows):
             y = r * cell_height
-            cv2.line(annotated_img, (0, y), (width, y), (0, 155, 255), 3)
+            cv2.line(annotated_img, (0, y), (width, y), (0, 0, 255), 2)
         for c in range(1, self.cols):
             x = c * cell_width
-            cv2.line(annotated_img, (x, 0), (x, height), (0, 155, 255), 3)
+            cv2.line(annotated_img, (x, 0), (x, height), (0, 0, 255), 2)
         return overall_darkness, cell_darkness, annotated_img
