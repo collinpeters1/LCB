@@ -1,3 +1,4 @@
+#Shell by ChatGPT, edited by Erika Griffin
 import cv2
 import time
 import numpy as np
@@ -31,7 +32,7 @@ class LightingAnalyzer:
     computes overall darkness and per-cell darkness for a 3x2 grid,
     and draws grid lines with annotations.
     """
-    def __init__(self, threshold_value=15, rows=3, cols=2):
+    def __init__(self, threshold_value=10, rows=3, cols=2):
         self.threshold_value = threshold_value
         self.rows = rows
         self.cols = cols
