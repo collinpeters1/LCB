@@ -7,7 +7,13 @@ from modules.LightingAnalysis import CameraManager, LightingAnalyzer
 from modules.DualPicam import PicamFeed
 from modules.UPS import get_ups_data
 from modules.ModeSwitches import ModeSwitches
-from modules.LightPolicy import init_state, reset_all, step_and_apply
+# ⬇️ replaced LightPolicy with PIDPolicy
+from modules.PIDPolicy import (
+    PIDManager,
+    init_state as pid_init_state,
+    reset_all as pid_reset_all,
+    pid_step_and_apply,
+)
 from modules.OverlayRenderer import draw_analysis
 from modules.HDRView import ensure_active as hdr_ensure_active, capture_frame as hdr_capture_frame, show as hdr_show
 from modules.EmergencyController import EmergencyController
@@ -29,11 +35,14 @@ def main():
 
     analyzer = LightingAnalyzer(threshold_value=C.THRESHOLD_DARK, rows=3, cols=2)
 
-    dac = init_state()
+    # ⬇️ PID: state + manager
+    dac = pid_init_state()
+    pid_mgr = PIDManager(kp=7.5, ki=1.2, kd=0.8, out_slew_per_step=12.0, deadband=0.5)
+
     emer = EmergencyController()
     prev_auto_mode = None  # track for just_switched_to_auto
 
-    # --- NEW: runtime-adjustable darkness cutoff (starts from config) ---
+    # --- runtime-adjustable darkness cutoff (starts from config) ---
     dark_cutoff = int(clamp(C.THRESHOLD_DARK, 0, 100))  # percent 0..100
 
     # Start in Classroom profile
@@ -49,7 +58,7 @@ def main():
     )
     switch_in_progress = False
 
-    print("Starting multi-light control.")
+    print("Starting multi-light control (PID).")
     print("Hotkeys: q=quit  [ ]=brightness threshold  -=/+= darkness cutoff  \\=global/local-Otsu  E=exposure  P=profile")
 
     try:
@@ -64,22 +73,25 @@ def main():
                 overall_dark, cell_dark, img = analyzer.analyze(frame)
 
                 if auto_mode:
-                    dac = step_and_apply(
-                        cell_dark,
-                        dac,
-                        step=C.STEP,
-                        threshold_dark=dark_cutoff,   # <-- use live-adjustable cutoff
+                    # ⬇️ PID step instead of step_and_apply from LightPolicy
+                    dac = pid_step_and_apply(
+                        cell_darkness=cell_dark,
+                        state=dac,
+                        manager=pid_mgr,
+                        threshold_dark=dark_cutoff,
                         emergency_mode=emer.emergency
                     )
                 else:
+                    # On entry to MANUAL, zero hardware and reset integrators
                     if prev_auto_mode in (True, None):
-                        dac = reset_all(dac)
+                        dac = pid_reset_all(dac, pid_mgr)
+                    # Keep manual behavior: lights stay 0 unless manual knobs are added
                     for k in dac.keys():
                         dac[k] = 0
 
                 draw_analysis(img, dac, auto_mode)
 
-                # HUD: show analyzer threshold (T), mode, active profile, and NEW darkness cutoff (DARK)
+                # HUD: show analyzer threshold (T), mode, active profile, and darkness cutoff (DARK)
                 t_val = analyzer.get_threshold()
                 mode_str = getattr(analyzer, "threshold_mode", "global")
                 cv2.putText(
@@ -118,10 +130,10 @@ def main():
 
                 if event == "enter_returned_to_auto":
                     print("Returned to AUTO while UPS is already On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac)
+                    dac = pid_reset_all(dac, pid_mgr)
                 elif event == "enter_online_to_onbatt":
                     print("UPS transitioned Online -> On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac)
+                    dac = pid_reset_all(dac, pid_mgr)
                 elif event == "exit_online":
                     print("UPS back Online. EXITING EMERGENCY MODE.")
 
@@ -142,7 +154,7 @@ def main():
             if key in (ord('q'), 13, 10):
                 print("Exiting...")
                 try:
-                    dac = reset_all(dac)
+                    dac = pid_reset_all(dac, pid_mgr)
                 except Exception:
                     pass
                 break
@@ -153,7 +165,7 @@ def main():
             elif key == ord(']'):
                 analyzer.adjust_threshold(+5)
 
-            # NEW: Darkness cutoff adjustment (percentage of dark pixels to trigger)
+            # Darkness cutoff adjustment (percentage of dark pixels to target)
             elif key == ord('-'):
                 dark_cutoff = clamp(dark_cutoff - 2, 0, 100)
                 print(f"[Policy] darkness cutoff → {dark_cutoff}%")
@@ -184,7 +196,7 @@ def main():
 
     finally:
         try:
-            dac = reset_all(dac)
+            dac = pid_reset_all(dac, pid_mgr)
         except Exception:
             pass
         try:
@@ -197,9 +209,6 @@ def main():
             pass
         try:
             if hdr_cam_alt: hdr_cam_alt.release()
-        except Exception:
-            pass
-        try:
             cv2.destroyAllWindows()
         except Exception:
             pass
