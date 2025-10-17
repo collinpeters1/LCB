@@ -148,7 +148,7 @@ class LightingAnalyzer:
             cv2.line(annotated, (c * cw, 0), (c * cw, h), color, 3)
 
         # HUD
-        hud = f"Mode={self.threshold_mode}  T={self.threshold_value}"
-        cv2.putText(annotated, hud, (10, 25), font, 0.8, (255, 255, 255), 2)
+        #hud = f"Mode={self.threshold_mode}  T={self.threshold_value}"
+        #cv2.putText(annotated, hud, (10, 25), font, 0.8, (255, 255, 255), 2)
 
         return overall_dark, cell_dark, annotated

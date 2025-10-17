@@ -233,17 +233,17 @@ def pid_step_and_apply(cell_darkness: list, state: dict, manager: PIDManager, *,
     meas["LF2"] = min(float(cell_darkness[3]), float(cell_darkness[5])) if _pair_active(cell_darkness, 3, 5, target) else 0
 
     # Optional hierarchy: if a coupled light is already strong, bias its neighbor downward (less demand)
-    def _bias(name, neighbor, bias=4.0):
-        if state.get(neighbor, 0) > 80 and name in meas:
+    #def _bias(name, neighbor, bias=4.0):
+       # if state.get(neighbor, 0) > 80 and name in meas:
             # reduce measured darkness toward target to ease this neighbor
-            meas[name] = min(meas[name], target - bias)
+           # meas[name] = min(meas[name], target - bias)
 
-    _bias("HS11", "LS1")
-    _bias("HS21", "LS1")
-    _bias("HF1",  "LF1")
-    _bias("HS12", "LS2")
-    _bias("HS22", "LS2")
-    _bias("HF2",  "LF2")
+   # _bias("HS11", "LS1")
+   # _bias("HS21", "LS1")
+    #_bias("HF1",  "LF1")
+    #_bias("HS12", "LS2")
+    #_bias("HS22", "LS2")
+    #_bias("HF2",  "LF2")
 
     # Run all PIDs
     for light, m in meas.items():
