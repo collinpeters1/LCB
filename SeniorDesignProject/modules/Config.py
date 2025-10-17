@@ -20,7 +20,8 @@ WINDOW_ANALYSIS = "Analysis (C270)"
 WINDOW_HDR = "HDR Feed (CSI)"
 
 # Timing
-LOOP_SLEEP_S = 0.05
+# original value = 0.05
+LOOP_SLEEP_S = 0.01
 SWITCH_SETTLE_S = 0.05
 
 # Keys

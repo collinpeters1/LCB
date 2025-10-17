@@ -7,7 +7,8 @@ from modules.LightingAnalysis import CameraManager, LightingAnalyzer
 from modules.DualPicam import PicamFeed
 from modules.UPS import get_ups_data
 from modules.ModeSwitches import ModeSwitches
-from modules.LightPolicy import init_state, reset_all, step_and_apply
+#from modules.LightPolicy import init_state, reset_all, step_and_apply
+from modules.PIDPolicy import init_state, reset_all, pid_step_and_apply, PIDManager
 from modules.OverlayRenderer import draw_analysis
 from modules.HDRView import ensure_active as hdr_ensure_active, capture_frame as hdr_capture_frame, show as hdr_show
 from modules.EmergencyController import EmergencyController
@@ -29,7 +30,19 @@ def main():
 
     analyzer = LightingAnalyzer(threshold_value=C.THRESHOLD_DARK, rows=3, cols=2)
 
+    # PID POLICY CHANGES - COMMENT IN/OUT AS NECESSARY
+
     dac = init_state()
+    #ADDING PID FUNCTION IN HERE
+    pid = PIDManager(
+        kp=3.5, ki = 0.5, kd = 0.25,
+        sample_time = C.LOOP_SLEEP_S,
+        slew_per_step=10.0,
+        deadband=3.0
+        )
+    #checking the sample time
+    print("PID Sample_time =", next(iter(pid.pids.values())).sample_time)
+    
     emer = EmergencyController()
     prev_auto_mode = None  # track for just_switched_to_auto
 
@@ -64,16 +77,26 @@ def main():
                 overall_dark, cell_dark, img = analyzer.analyze(frame)
 
                 if auto_mode:
-                    dac = step_and_apply(
-                        cell_dark,
-                        dac,
-                        step=C.STEP,
-                        threshold_dark=dark_cutoff,   # <-- use live-adjustable cutoff
-                        emergency_mode=emer.emergency
+                    #messing with this - old version, true auto
+                    #dac = step_and_apply(
+                     #   cell_dark,
+                      #  dac,
+                       # step=C.STEP,
+                        #threshold_dark=dark_cutoff,   # <-- use live-adjustable cutoff
+                        #emergency_mode=emer.emergency
+                    #)
+                    dac = pid_step_and_apply(
+                        cell_darkness=cell_dark,
+                        state=dac,
+                        manager=pid,
+                        threshold_dark=dark_cutoff,
+                        emergency_mode=emer.emergency,
                     )
                 else:
                     if prev_auto_mode in (True, None):
-                        dac = reset_all(dac)
+                        #ANOTHER CHANGE FROM AUTO MODE, NOW WITH PID
+                        #dac = reset_all(dac)
+                        dac = reset_all(dac, pid)
                     for k in dac.keys():
                         dac[k] = 0
 
@@ -118,10 +141,10 @@ def main():
 
                 if event == "enter_returned_to_auto":
                     print("Returned to AUTO while UPS is already On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac)
+                    dac = reset_all(dac,pid)
                 elif event == "enter_online_to_onbatt":
                     print("UPS transitioned Online -> On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac)
+                    dac = reset_all(dac,pid)
                 elif event == "exit_online":
                     print("UPS back Online. EXITING EMERGENCY MODE.")
 
@@ -142,7 +165,7 @@ def main():
             if key in (ord('q'), 13, 10):
                 print("Exiting...")
                 try:
-                    dac = reset_all(dac)
+                    dac = reset_all(dac,pid)
                 except Exception:
                     pass
                 break
@@ -184,7 +207,8 @@ def main():
 
     finally:
         try:
-            dac = reset_all(dac)
+            #dac = reset_all(dac)
+            dac = reset_all(dac,pid)
         except Exception:
             pass
         try:

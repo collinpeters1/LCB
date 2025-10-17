@@ -117,8 +117,8 @@ class PIDManager:
                  sample_time=None,         # None -> compute every call
                  slew_per_step=12.0,       # max DAC delta per loop
                  deadband=0.5,             # percent dark around target treated as zero error
-                 proportional_on_measurement=True,
-                 differential_on_measurement=True):
+                 proportional_on_measurement=False,
+                 differential_on_measurement=False):
         self.pids = {}
         self.slew = float(slew_per_step)
         self.deadband = float(deadband)
@@ -149,15 +149,18 @@ class PIDManager:
             self.prev_out[name] = last
 
     def step(self, name: str, setpoint: float, measurement: float) -> int:
-        """Compute new output for one light with deadband and slew limit."""
         pid = self.pids[name]
         pid.setpoint = float(setpoint)
 
-        # Deadband around target: if |meas - setpoint| < deadband, pretend meas == setpoint
+        # Deadband
         if abs(measurement - setpoint) < self.deadband:
             measurement = setpoint
 
-        out = pid(measurement)  # simple_pid __call__(measurement) -> output
+        # Error in the same sign-space as our error_map (meas - setpoint)
+        err = measurement - setpoint
+
+        out = pid(measurement)
+
         # Slew limit
         prev = self.prev_out.get(name, 0.0)
         delta = out - prev
@@ -166,10 +169,19 @@ class PIDManager:
         elif delta < -self.slew:
             out = prev - self.slew
 
-        # Clamp & store
+        # Clamp
         lo, hi = self.output_limits
         if lo is not None: out = max(lo, out)
         if hi is not None: out = min(hi, out)
+
+        # Anti-windup bleed: if saturated and still pushing further, ease integral
+        # (simple, robust; avoids integrator run-away without digging into internals)
+        try:
+            if (out >= hi and err > 0) or (out <= lo and err < 0):
+                pid.integral *= 0.5
+        except Exception:
+            pass
+
         self.prev_out[name] = out
         return int(round(out))
 
@@ -179,6 +191,7 @@ def reset_all(state: dict, manager: PIDManager) -> dict:
     for (col, ch) in CHANNEL_MAP.values():
         _write_dac(0, ch, col)
     # Zero state & PIDs
+    #for k in state.keys():
     for k in state.keys():
         state[k] = 0
     manager.reset_all(keep_outputs=False)
@@ -194,9 +207,11 @@ def pid_step_and_apply(cell_darkness: list, state: dict, manager: PIDManager, *,
     if emergency_mode:
         for k in state.keys():
             state[k] = 0
-        state["LF2"] = min(255, state.get("LF2", 0) + 15)
+        #state["LF2"] = min(state["LF2"] + 15, 255)
+        #state["LF2"] = min(255, state.get("LF2", 0) + 15)
+        state["LF2"] = 255
         _push_all(state, CHANNEL_MAP)
-        manager.reset_all(keep_outputs=True)
+        #manager.reset_all(keep_outputs=True)
         return state
 
     target = float(threshold_dark)
@@ -212,10 +227,10 @@ def pid_step_and_apply(cell_darkness: list, state: dict, manager: PIDManager, *,
     }
 
     # Coupled lights require BOTH sectors above threshold; else treat like target to let PID back down
-    meas["LS1"] = min(float(cell_darkness[0]), float(cell_darkness[2])) if _pair_active(cell_darkness, 0, 2, target) else target
-    meas["LF1"] = min(float(cell_darkness[2]), float(cell_darkness[4])) if _pair_active(cell_darkness, 2, 4, target) else target
-    meas["LS2"] = min(float(cell_darkness[1]), float(cell_darkness[3])) if _pair_active(cell_darkness, 1, 3, target) else target
-    meas["LF2"] = min(float(cell_darkness[3]), float(cell_darkness[5])) if _pair_active(cell_darkness, 3, 5, target) else target
+    meas["LS1"] = min(float(cell_darkness[0]), float(cell_darkness[2])) if _pair_active(cell_darkness, 0, 2, target) else 0
+    meas["LF1"] = min(float(cell_darkness[2]), float(cell_darkness[4])) if _pair_active(cell_darkness, 2, 4, target) else 0
+    meas["LS2"] = min(float(cell_darkness[1]), float(cell_darkness[3])) if _pair_active(cell_darkness, 1, 3, target) else 0
+    meas["LF2"] = min(float(cell_darkness[3]), float(cell_darkness[5])) if _pair_active(cell_darkness, 3, 5, target) else 0
 
     # Optional hierarchy: if a coupled light is already strong, bias its neighbor downward (less demand)
     def _bias(name, neighbor, bias=4.0):
