@@ -109,13 +109,13 @@ def _put_hdr_overlay(frame, *, active_name: str, auto_mode: bool, ups_data: dict
     h, m, s = runtime_sec // 3600, (runtime_sec % 3600) // 60, runtime_sec % 60
     formatted_runtime = f"{h:02}:{m:02}:{s:02}"
 
-    cv2.putText(frame, f"Active: {active_name}",         (10, 30),  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-    cv2.putText(frame, f"UPS Status: {current_status}",  (10, 60),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-    cv2.putText(frame, f"Charge: {current_charge}%",     (10, 90),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-    cv2.putText(frame, f"Runtime: {formatted_runtime}",  (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    cv2.putText(frame, f"Active: {active_name}",         (10, 30),  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+    cv2.putText(frame, f"UPS Status: {current_status}",  (10, 60),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
+    cv2.putText(frame, f"Charge: {current_charge}%",     (10, 90),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
+    cv2.putText(frame, f"Runtime: {formatted_runtime}",  (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
     mode_text_hdr = "MODE: AUTO" if auto_mode else "MODE: MANUAL"
-    cv2.putText(frame, mode_text_hdr, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+    cv2.putText(frame, mode_text_hdr, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
 
     if auto_mode and emergency_mode:
         cv2.putText(frame, "EMERGENCY MODE", (10, 185),

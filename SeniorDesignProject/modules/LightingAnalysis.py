@@ -44,7 +44,7 @@ class LightingAnalyzer:
       • 'global'     – fixed threshold_value
       • 'local_otsu' – Otsu computed separately in each grid cell
     """
-    def __init__(self, threshold_value=40, rows=3, cols=2):
+    def __init__(self, threshold_value=30, rows=3, cols=2):
         self.threshold_value = int(threshold_value)
         self.rows = rows
         self.cols = cols

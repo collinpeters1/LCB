@@ -1,25 +1,31 @@
 # modules/PIDPolicy.py
-# PID lighting control using simple-pid 2.0.0
+# PID lighting control using simple-pid 2.0.0, with FLOOD shaping only.
 #
 # Behavior:
-# - Target each covered sector to THRESHOLD_DARK (% dark).
-# - Uses simple_pid.PID per light (with PoM & DoM to reduce overshoot).
-# - Error sign handled via error_map so "too dark" => increase output.
-# - Output slew limiting to avoid visible stepping/flicker.
-# - Emergency mode: all off except LF2 ramps quickly to max.
+# - Each light tries to hold its covered sector(s) near threshold_dark % darkness.
+# - simple_pid.PID per light.
+# - Slew limiting, deadband, anti-windup.
+# - Emergency mode: everything off except LF2 forced to 255.
+# - Channel map can load from /home/pi/hardware_map.json if present.
 #
-# Mapping:
-# - Loads /home/pi/hardware_map.json if present (from MapWizard.py).
-# - Falls back to DEFAULT_CHANNEL_MAP otherwise.
+# NEW:
+# - Before sending to the DAC, flood-class lights (HF1, HF2, LF1, LF2)
+#   get their logical 0..255 value remapped into a tight DAC window
+#   [FLOOD_MIN_DAC..FLOOD_MAX_DAC] so that the tiny physical usable
+#   range (where they actually light up) is stretched across the
+#   whole control range.
+#
+#   Spots / other lights are passed through unchanged.
 
 import time
 import json
 import spidev
 from simple_pid import PID  # pip install simple-pid
+from modules.FloodMap import map_state  # <-- NEW
 
 # -------------------- SPI / DAC --------------------
 SPI_BUS = 1
-# Column 1 -> CE1 (device=1), Column 2 -> CE0 (device=0). Flip if needed.
+# Column 1 -> CE1 (device=1), Column 2 -> CE0 (device=0). Flip if wired opposite.
 COL_TO_DEVICE = {1: 1, 2: 0}
 
 def _write_dac(value: int, channel: int, column: int):
@@ -37,7 +43,14 @@ def _write_dac(value: int, channel: int, column: int):
     s.close()
 
 def _push_all(state: dict, channel_map: dict):
-    for name, val in state.items():
+    """
+    Push current state to hardware.
+    We first apply per-light shaping (flood stretching).
+    We do NOT mutate the caller's dict, so PID logic still "thinks"
+    in normal 0..255 space.
+    """
+    shaped = map_state(state)  # <-- NEW
+    for name, val in shaped.items():
         if name in channel_map:
             col, ch = channel_map[name]
             _write_dac(val, ch, col)
@@ -76,8 +89,8 @@ DEFAULT_CHANNEL_MAP = {
 
 CHANNEL_MAP = _load_user_map() or DEFAULT_CHANNEL_MAP
 
-# -------------------- Coverage (which sectors each light helps) --------------------
-# Sector indices (row-major):
+# -------------------- Coverage map --------------------
+# Sector indices:
 # 0:S11  1:S12
 # 2:S21  3:S22
 # 4:S31  5:S32
@@ -95,28 +108,26 @@ LIGHT_TO_SECTORS = {
     "LF2":  [3, 5],  # both must be dark
 }
 
-# -------------------- Helpers --------------------
 def _pair_active(vals, ia, ib, thresh):
     return (vals[ia] >= thresh) and (vals[ib] >= thresh)
 
 def init_state() -> dict:
     return {k: 0 for k in CHANNEL_MAP.keys()}
 
-# -------------------- PID Manager (simple-pid) --------------------
+# -------------------- PID Manager --------------------
 class PIDManager:
     """
-    Holds one simple_pid.PID per light.
-    Notes:
-      - setpoint is the darkness threshold (e.g., 10%).
-      - error_map inverts sign: e_mapped = -(setpoint - measurement) = (measurement - setpoint).
-        So when it's too dark (meas > setpoint), control is positive -> increases light.
+    One simple_pid.PID per light.
+    setpoint = target darkness (threshold_dark).
+    We flip sign using error_map so "too dark" => positive output.
+    We also slew-limit so lights don't jump frame-to-frame.
     """
     def __init__(self,
                  kp=7.5, ki=1.2, kd=0.8,
                  output_limits=(0, 255),
-                 sample_time=None,         # None -> compute every call
-                 slew_per_step=12.0,       # max DAC delta per loop
-                 deadband=0.5,             # percent dark around target treated as zero error
+                 sample_time=None,
+                 slew_per_step=12.0,
+                 deadband=0.5,
                  proportional_on_measurement=False,
                  differential_on_measurement=False):
         self.pids = {}
@@ -127,17 +138,16 @@ class PIDManager:
         for name in CHANNEL_MAP.keys():
             pid = PID(
                 kp, ki, kd,
-                setpoint=0.0,  # placeholder; set each loop from threshold
+                setpoint=0.0,
                 sample_time=sample_time,
                 output_limits=output_limits,
                 auto_mode=True,
                 proportional_on_measurement=proportional_on_measurement,
                 differential_on_measurement=differential_on_measurement,
-                error_map=lambda e: -e  # invert sign so (meas - setpoint) drives positive when too dark
+                error_map=lambda e: -e  # makes error = meas-setpoint
             )
             self.pids[name] = pid
 
-        # Track previous outputs for slew limiting
         self.prev_out = {name: 0.0 for name in CHANNEL_MAP.keys()}
 
     def reset_all(self, keep_outputs=False):
@@ -145,23 +155,23 @@ class PIDManager:
             last = self.prev_out.get(name, 0.0) if keep_outputs else 0.0
             pid.set_auto_mode(True, last_output=last)
             pid.auto_mode = True
-            pid.integral = 0.0  # clear I term
+            pid.integral = 0.0
             self.prev_out[name] = last
 
     def step(self, name: str, setpoint: float, measurement: float) -> int:
         pid = self.pids[name]
         pid.setpoint = float(setpoint)
 
-        # Deadband
+        # deadband: if we're basically at target, lie and say we're perfect
         if abs(measurement - setpoint) < self.deadband:
             measurement = setpoint
 
-        # Error in the same sign-space as our error_map (meas - setpoint)
+        # for anti-windup
         err = measurement - setpoint
 
         out = pid(measurement)
 
-        # Slew limit
+        # slew limit
         prev = self.prev_out.get(name, 0.0)
         delta = out - prev
         if delta > self.slew:
@@ -169,13 +179,12 @@ class PIDManager:
         elif delta < -self.slew:
             out = prev - self.slew
 
-        # Clamp
+        # clamp
         lo, hi = self.output_limits
         if lo is not None: out = max(lo, out)
         if hi is not None: out = min(hi, out)
 
-        # Anti-windup bleed: if saturated and still pushing further, ease integral
-        # (simple, robust; avoids integrator run-away without digging into internals)
+        # bleed integral if pinned
         try:
             if (out >= hi and err > 0) or (out <= lo and err < 0):
                 pid.integral *= 0.5
@@ -187,36 +196,28 @@ class PIDManager:
 
 # -------------------- Public API --------------------
 def reset_all(state: dict, manager: PIDManager) -> dict:
-    # Hardware off
-    for (col, ch) in CHANNEL_MAP.values():
-        _write_dac(0, ch, col)
-    # Zero state & PIDs
-    #for k in state.keys():
     for k in state.keys():
         state[k] = 0
+    _push_all(state, CHANNEL_MAP)  # will map floods too
     manager.reset_all(keep_outputs=False)
     return state
 
 def pid_step_and_apply(cell_darkness: list, state: dict, manager: PIDManager, *,
                        threshold_dark: float, emergency_mode: bool) -> dict:
     """
-    - cell_darkness: [S11,S12,S21,S22,S31,S32] in % dark
-    - threshold_dark: desired darkness (e.g., 10)
-    - emergency_mode: if True, all off except LF2 ramps fast to max
+    cell_darkness: [S11,S12,S21,S22,S31,S32] in % dark
+    threshold_dark: desired darkness (e.g., 10)
+    emergency_mode: True -> all off except LF2=255 (still mapped before DAC)
     """
     if emergency_mode:
         for k in state.keys():
             state[k] = 0
-        #state["LF2"] = min(state["LF2"] + 15, 255)
-        #state["LF2"] = min(255, state.get("LF2", 0) + 15)
         state["LF2"] = 255
         _push_all(state, CHANNEL_MAP)
-        #manager.reset_all(keep_outputs=True)
         return state
 
     target = float(threshold_dark)
 
-    # Measurements per light
     meas = {
         "HS11": float(cell_darkness[0]),
         "HS21": float(cell_darkness[2]),
@@ -226,26 +227,11 @@ def pid_step_and_apply(cell_darkness: list, state: dict, manager: PIDManager, *,
         "HF2":  float(cell_darkness[5]),
     }
 
-    # Coupled lights require BOTH sectors above threshold; else treat like target to let PID back down
     meas["LS1"] = min(float(cell_darkness[0]), float(cell_darkness[2])) if _pair_active(cell_darkness, 0, 2, target) else 0
     meas["LF1"] = min(float(cell_darkness[2]), float(cell_darkness[4])) if _pair_active(cell_darkness, 2, 4, target) else 0
     meas["LS2"] = min(float(cell_darkness[1]), float(cell_darkness[3])) if _pair_active(cell_darkness, 1, 3, target) else 0
     meas["LF2"] = min(float(cell_darkness[3]), float(cell_darkness[5])) if _pair_active(cell_darkness, 3, 5, target) else 0
 
-    # Optional hierarchy: if a coupled light is already strong, bias its neighbor downward (less demand)
-    #def _bias(name, neighbor, bias=4.0):
-       # if state.get(neighbor, 0) > 80 and name in meas:
-            # reduce measured darkness toward target to ease this neighbor
-           # meas[name] = min(meas[name], target - bias)
-
-   # _bias("HS11", "LS1")
-   # _bias("HS21", "LS1")
-    #_bias("HF1",  "LF1")
-    #_bias("HS12", "LS2")
-    #_bias("HS22", "LS2")
-    #_bias("HF2",  "LF2")
-
-    # Run all PIDs
     for light, m in meas.items():
         state[light] = manager.step(light, target, m)
 

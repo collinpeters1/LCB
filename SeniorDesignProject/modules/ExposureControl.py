@@ -51,7 +51,7 @@ PROFILES = {
         "exposure": "auto",       # leave camera in auto
         "exposure_ms": 15.0,      # ignored in auto
         "gain": None,             # ignored in auto
-        "threshold": 40,          # analyzer threshold target
+        "threshold": 30,          # analyzer threshold target
         "otsu": False,
     },
     # Stable, high-contrast environment (moon-like)
@@ -93,4 +93,4 @@ def cycle_profile(current_name: str, analyzer, dev: str = EXPO_DEV) -> str:
     idx = PROFILE_ORDER.index(current_name) if current_name in PROFILE_ORDER else 0
     new = PROFILE_ORDER[(idx + 1) % len(PROFILE_ORDER)]
     apply_profile(new, analyzer, dev)
-    return new
+    return new90

@@ -35,10 +35,10 @@ def main():
     dac = init_state()
     #ADDING PID FUNCTION IN HERE
     pid = PIDManager(
-        #kp=3.6, ki = 4.0, kd = 0.025,
+        kp=3.6, ki = 4.2, kd = 0.025,
         # kp=.4, ki = 0.1, kd = 0.00, - STEADY STATE
-        kp=.1, ki = 0.03, kd = 0.0,
-        sample_time = C.LOOP_SLEEP_S,
+        #kp=1.5, ki = 0.23, kd = 0.05,
+        sample_time = C.LOOP_SLEEP_S/5,
         slew_per_step=1.0,
         deadband=2.0
         )

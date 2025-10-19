@@ -8,7 +8,7 @@ DN_DEBOUNCE_MS = 75
 
 # Analysis camera / processing
 ANALYSIS_CAMERA_INDEX = 0
-THRESHOLD_DARK = 10
+THRESHOLD_DARK = 30
 STEP = 3
 
 # HDR labels (purely text labels used throughout UI)
