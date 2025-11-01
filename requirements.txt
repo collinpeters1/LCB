@@ -2,3 +2,12 @@ simple-pid==2.0.0
 RPi.GPIO
 spidev
 numpy
+numpy
+scipy
+matplotlib
+opencv-python
+spidev
+rpi-lgpio
+simplejpeg
+picamera2
+REQ
