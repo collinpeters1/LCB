@@ -23,6 +23,10 @@ import spidev
 from simple_pid import PID  # pip install simple-pid
 from modules.FloodMap import map_state  # <-- NEW
 
+from pathlib import Path
+MAP_PATH = str(Path.home() / "hardware_map.json")
+
+
 # -------------------- SPI / DAC --------------------
 SPI_BUS = 1
 # Column 1 -> CE1 (device=1), Column 2 -> CE0 (device=0). Flip if wired opposite.
@@ -56,7 +60,7 @@ def _push_all(state: dict, channel_map: dict):
             _write_dac(val, ch, col)
 
 # -------------------- Channel mapping --------------------
-def _load_user_map(path="/home/pi/hardware_map.json"):
+def _load_user_map(path=MAP_PATH):
     try:
         with open(path, "r") as f:
             raw = json.load(f)  # {"HS11":[1,1], ...}
