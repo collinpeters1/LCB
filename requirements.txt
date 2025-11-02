@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 asgiref==3.6.0
 astroid==2.14.2
 asttokens==2.2.1
@@ -248,3 +249,18 @@ webencodings==0.5.1
 Werkzeug==2.2.2
 wrapt==1.14.1
 zipp==1.0.0
+=======
+simple-pid==2.0.0
+RPi.GPIO
+spidev
+numpy
+numpy
+scipy
+matplotlib
+opencv-python
+spidev
+rpi-lgpio
+simplejpeg
+picamera2
+REQ
+>>>>>>> origin/PID_LCB
