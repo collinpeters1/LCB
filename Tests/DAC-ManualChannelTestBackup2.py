@@ -132,7 +132,7 @@ def draw_ui(stdscr, active_col, active_idx, state, last_nonzero):
 
     # Quick-reference help text below the table
     help_lines = [
-        "←/→: prev/next channel    ↑/+/PageUp: +1/+25    ↓/-/PageDown: -1/-25",
+        "←/→: prev/next channel    ↑/+/PageUp: +1/+16    ↓/-/PageDown: -1/-16",
         "Tab/s: switch column      0: zero     =: 255     space: toggle 0 <-> last",
         "v: type value (0..255)    x: zero active column  X: zero BOTH columns",
         "q: quit",
@@ -220,11 +220,11 @@ def main(stdscr):
             # --- Coarse adjustments (PageUp/PageDown) ---
             elif ch == curses.KEY_PPAGE:
                 chan = active_idx + 1
-                state[active_col][chan] = clamp(state[active_col][chan] + 5, 0, 255)
+                state[active_col][chan] = clamp(state[active_col][chan] + 16, 0, 255)
                 dac.write(column=active_col, channel=chan, value=state[active_col][chan])
             elif ch == curses.KEY_NPAGE:
                 chan = active_idx + 1
-                state[active_col][chan] = clamp(state[active_col][chan] - 5, 0, 255)
+                state[active_col][chan] = clamp(state[active_col][chan] - 16, 0, 255)
                 dac.write(column=active_col, channel=chan, value=state[active_col][chan])
 
             # --- Preset buttons ---
