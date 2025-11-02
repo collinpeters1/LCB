@@ -6,8 +6,10 @@ Fast, mono-camera system-identification test for ICLS lighting.
 - Uses Config.ANALYSIS_CAMERA_INDEX to open the correct /dev/videoX
 - Forces mono (Y8) capture for the OV9281 analysis cam
 - Generates a random-telegraph stimulus (high/low DAC)
-- Logs rich per-frame data with metadata header
-- Estimates delay via correlation
+- Logs rich per-frame data with metadata header (now logs 6 sector metrics + 6 sector means)
+- Estimates delay via *causal* correlation (|corr|, lags >= 0) using S11 only for y[]
+- NEW: Runs every mapped light sequentially; zeros all lights between tests
+- NEW: Labels logs with light name, column, and channel for MATLAB post-processing
 """
 
 import os, sys, time, csv, signal, glob, subprocess
@@ -30,6 +32,7 @@ sys.path.insert(0, MODULES_DIR)
 from modules import PIDPolicy
 from modules import Config as C
 from modules import ExposureControl as EC
+from modules.LightingAnalysis import LightingAnalyzer  # sector %dark
 
 # ------------------------------------------------------------
 # CONFIG (globals the menu can tweak)
@@ -39,7 +42,9 @@ STIM_HOLD_FRAMES = 3         # how many frames each bit is held
 HIGH_VAL = 200               # DAC high level
 LOW_VAL  = 0                 # DAC low level
 DARK_THRESH = 20             # pixel < thresh counted as "dark"
-TEST_LIGHT_NAME = "HS22"     # which light/channel we drive
+# default single-light selection for "Run one light" menu option:
+TEST_LIGHT_NAME = "HS22"
+
 CAM_INDEX = int(C.ANALYSIS_CAMERA_INDEX)  # from your Config module
 CAM_DEVICE = f"/dev/video{CAM_INDEX}"
 
@@ -54,7 +59,7 @@ def handle_sigint(sig, frame):
 signal.signal(signal.SIGINT, handle_sigint)
 
 # ------------------------------------------------------------
-# DAC helper
+# DAC helpers
 # ------------------------------------------------------------
 def write_test_light(light_name: str, raw_val: int):
     v = int(max(0, min(255, raw_val)))
@@ -95,7 +100,7 @@ def zero_all_lights():
         print(f"[ERR] Failed to zero lights: {e}")
 
 # ------------------------------------------------------------
-# Frame reshape helpers, stats, stimulus, delay
+# Frame reshape helpers & stimulus
 # ------------------------------------------------------------
 def reshape_if_flat_ov9281(frame):
     """
@@ -133,70 +138,6 @@ def reshape_if_flat_ov9281(frame):
     # Already 2-D in a sane way, just return
     return frame
 
-def make_metric_fn(is_mono: bool):
-    """
-    Returns a function metric_from_frame(frame) -> %dark
-    """
-    def _reshape_if_flat(frame):
-        if frame.ndim == 2 and frame.shape[0] == 1 and frame.shape[1] > 1e6:
-            n = frame.shape[1]
-            if n == 921600:
-                frame = frame.reshape((720, 1280))
-            elif n == 1843200:
-                frame = frame.reshape((720, 2560))
-            elif n == 2073600:
-                frame = frame.reshape((1080, 1920))
-            else:
-                frame = frame.reshape((720, n // 720))
-        return frame
-
-    if is_mono:
-        def metric_from_frame(frame, thresh=DARK_THRESH):
-            # Fix flattened mono case
-            if frame.ndim == 2 and frame.shape[1] == 1 and frame.shape[0] in (1843200, 921600):
-                w = 2560 if frame.shape[0] == 1843200 else 1280
-                h = 720
-                frame = frame.reshape((h, w))
-            else:
-                frame = _reshape_if_flat(frame)
-
-            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
-
-            adaptive_thresh = max(5, min(250, int(np.mean(small) * 0.8)))
-            _, mask = cv2.threshold(small, adaptive_thresh, 255, cv2.THRESH_BINARY_INV)
-
-            return 100.0 * (np.count_nonzero(mask) / mask.size)
-    else:
-        def metric_from_frame(frame, thresh=DARK_THRESH):
-            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            adaptive_thresh = max(5, min(250, int(np.mean(gray) * 0.8)))
-            _, mask = cv2.threshold(gray, adaptive_thresh, 255, cv2.THRESH_BINARY_INV)
-            return 100.0 * (np.count_nonzero(mask) / mask.size)
-
-    return metric_from_frame
-
-def roi_stats_mono(small_u8):
-    """
-    small_u8: 2-D uint8 image after resize.
-    Returns:
-      (y_metric, y_mean, y_std, y_p10, y_p90, sat_lo%, sat_hi%)
-    """
-    v = small_u8.reshape(-1)
-
-    dark_mask = (small_u8 < DARK_THRESH)
-    y_metric = 100.0 * (np.count_nonzero(dark_mask) / dark_mask.size)
-
-    y_mean = float(np.mean(v))
-    y_std  = float(np.std(v))
-    y_p10  = float(np.percentile(v, 10))
-    y_p90  = float(np.percentile(v, 90))
-
-    sat_lo = 100.0 * (np.count_nonzero(v == 0)   / v.size)
-    sat_hi = 100.0 * (np.count_nonzero(v == 255) / v.size)
-
-    return (y_metric, y_mean, y_std, y_p10, y_p90, sat_lo, sat_hi)
-
 def rand_telegraph(length: int) -> np.ndarray:
     return np.where(np.random.rand(length) < 0.5, -1, +1).astype(np.int8)
 
@@ -225,22 +166,70 @@ def build_stim_sequence(low_val, high_val, hold_frames, run_seconds, est_fps, mo
     return u_seq.astype(np.int16), stim_bits.astype(np.int8)
 
 # ------------------------------------------------------------
-# Core data run
+# NEW: sector mean brightness helper (linear observable, 0..255)
 # ------------------------------------------------------------
-def main(exposure_ms, gain):
+def sector_means(frame, rows=3, cols=2):
+    """Compute mean brightness per sector on a rows×cols grid."""
+    if frame.ndim == 2:
+        v = frame
+    else:
+        v = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = v.shape
+    ch, cw = h // rows, w // cols
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            y0, y1 = r * ch, (r + 1) * ch if r < rows - 1 else h
+            x0, x1 = c * cw, (c + 1) * cw if c < cols - 1 else w
+            tile = v[y0:y1, x0:x1]
+            out.append(float(np.mean(tile)) if tile.size else float('nan'))
+    return out  # len 6
+
+# ------------------------------------------------------------
+# NEW: causal lag estimate (|corr|, lags >= 0)
+# ------------------------------------------------------------
+def causal_lag_seconds(u_arr: np.ndarray, y_arr: np.ndarray, t_arr: np.ndarray) -> float:
+    if len(t_arr) < 3 or len(u_arr) < 3 or len(y_arr) < 3:
+        return 0.0
+    # z-normalize
+    u = (u_arr - np.mean(u_arr)) / (np.std(u_arr) + 1e-9)
+    y = (y_arr - np.mean(y_arr)) / (np.std(y_arr) + 1e-9)
+    corr = correlate(y, u, mode="full")
+    lags = np.arange(-len(u) + 1, len(u))
+    # causal mask
+    mask = lags >= 0
+    if not np.any(mask):
+        return 0.0
+    best_idx = int(np.argmax(np.abs(corr[mask])))
+    best_lag_frames = int(lags[mask][best_idx])
+    Ts = np.median(np.diff(t_arr)) if len(t_arr) > 1 else (1.0 / 30.0)
+    return float(best_lag_frames * Ts)
+
+# ------------------------------------------------------------
+# Core data run (single light)
+# ------------------------------------------------------------
+def run_single_light(light_name: str, exposure_ms: float, gain: float):
     """
-    Run one identification capture:
+    Run one identification capture for a single light:
     - locks exposure (hard fail if we can't)
     - generates stimulus u_seq
-    - logs rich per-frame data to CSV with metadata header
-    - saves plot and prints delay estimate
+    - logs per-frame data to CSV with metadata header (S11..S32 %dark + mu_Sxx brightness)
+    - saves plot and prints delay estimate (causal |corr|, S11 only)
     """
-
     global DARK_THRESH, HIGH_VAL, LOW_VAL, RUN_SECONDS, STIM_HOLD_FRAMES
 
-    print(f"[INIT] Driving light '{TEST_LIGHT_NAME}'")
+    if light_name not in PIDPolicy.CHANNEL_MAP:
+        print(f"[ERR] Unknown light '{light_name}'. Skipping.")
+        return
+
+    col, ch = PIDPolicy.CHANNEL_MAP[light_name]
+    print(f"[INIT] Driving light '{light_name}'  (col={col}, ch={ch})")
     print(f"[INIT] Using analysis camera index {CAM_INDEX} ({CAM_DEVICE})")
     print(f"[INIT] Target exposure={exposure_ms:.2f} ms  gain={gain}")
+
+    # 0. Zero everything before this light's run
+    zero_all_lights()
+    time.sleep(getattr(C, "SWITCH_SETTLE_S", 0.05))
 
     # 1. Force manual exposure. NO try/except: if this fails we WANT to die.
     EC.set_exposure_manual(
@@ -278,14 +267,14 @@ def main(exposure_ms, gain):
     test_frame = reshape_if_flat_ov9281(test_frame)
 
     h0, w0 = test_frame.shape[:2]
-    is_mono = (test_frame.ndim == 2) or (
-        test_frame.ndim == 3 and test_frame.shape[2] == 1
-    )
+    is_mono = (test_frame.ndim == 2) or (test_frame.ndim == 3 and test_frame.shape[2] == 1)
     chans = 1 if is_mono else (test_frame.shape[2] if test_frame.ndim == 3 else 1)
 
     print(f"[INIT] Camera OK {w0}x{h0} — {'MONO' if is_mono else 'COLOR'} ({chans}ch)")
 
-    metric_from_frame = make_metric_fn(is_mono)
+    # 2b. Instantiate the LightingAnalyzer (3×2) for %dark
+    analyzer = LightingAnalyzer(threshold_value=DARK_THRESH, rows=3, cols=2)
+    print(f"[INIT] Using LightingAnalyzer (3r, 2c) with thresh={DARK_THRESH}")
 
     # 3. Build the stimulus sequence we plan to apply
     EST_FPS = 30.0
@@ -303,8 +292,8 @@ def main(exposure_ms, gain):
     # 4. Prep logging
     os.makedirs("logs", exist_ok=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"logs/idlog_{timestamp_str}.csv"
-    png_path = f"logs/idlog_{timestamp_str}.png"
+    csv_path = f"logs/idlog_{timestamp_str}_{light_name}_c{col}ch{ch}.csv"
+    png_path = f"logs/idlog_{timestamp_str}_{light_name}_c{col}ch{ch}.png"
 
     csvfile = open(csv_path, "w", newline="")
     writer = csv.writer(csvfile)
@@ -319,7 +308,9 @@ def main(exposure_ms, gain):
         "low": LOW_VAL,
         "high": HIGH_VAL,
         "hold_frames": STIM_HOLD_FRAMES,
-        "test_light": TEST_LIGHT_NAME,
+        "test_light": light_name,
+        "light_col": col,
+        "light_channel": ch,
         "duration_s": RUN_SECONDS,
         "dark_thresh": DARK_THRESH,
         "notes": "door closed, lab lights on, ~1m distance"
@@ -327,12 +318,14 @@ def main(exposure_ms, gain):
     for k, v in meta.items():
         csvfile.write(f"# {k}: {v}\n")
 
+    # NEW CSV header: add mu_Sxx (mean brightness)
     writer.writerow([
         "frame_idx","t_s","dt_s",
         "u_dac","stim_bit",
-        "y_metric","y_mean","y_std",
-        "y_p10","y_p90",
-        "sat_lo_pct","sat_hi_pct",
+        # linear brightness per sector
+        "mu_S11","mu_S12","mu_S21","mu_S22","mu_S31","mu_S32",
+        # %dark per sector (from LightingAnalyzer)
+        "y_S11","y_S12","y_S21","y_S22","y_S31","y_S32",
         "frame_drop"
     ])
 
@@ -340,13 +333,14 @@ def main(exposure_ms, gain):
     print("[LOOP] Starting acquisition...")
 
     frame_times = []
-    y_list = []
+    y_list = []   # S11 %dark series for plotting/correlation
+    mu_list = []  # S11 mean brightness (optional visual later)
     t_start = time.perf_counter()
     frame_idx = -1
 
     # set initial DAC level before loop
     current_level = int(u_seq[0])
-    write_test_light(TEST_LIGHT_NAME, current_level)
+    write_test_light(light_name, current_level)
 
     while True:
         frame_idx += 1
@@ -376,21 +370,24 @@ def main(exposure_ms, gain):
                 med_dt = dt_s
             frame_drop_flag = 1 if dt_s > (1.5 * med_dt) else 0
 
-        # downsample for stats
-        if is_mono:
-            gray_small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
-        else:
-            small_color = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
-            gray_small  = cv2.cvtColor(small_color, cv2.COLOR_BGR2GRAY)
+        # ---- sector metrics
+        try:
+            _overall_dark, cell_dark, _annot = analyzer.analyze(frame)
+        except Exception as e:
+            print(f"[WARN] analyzer.analyze() failed: {e}")
+            cell_dark = None
 
-        (y_metric,
-         y_mean,
-         y_std,
-         y_p10,
-         y_p90,
-         sat_lo,
-         sat_hi) = roi_stats_mono(gray_small)
-        y_list.append(y_metric)
+        if cell_dark is None or len(cell_dark) != 6:
+            cell_dark = [-1.0] * 6  # ensure 6 values are logged
+
+        # mean brightness (linear)
+        mu = sector_means(frame, rows=3, cols=2)
+        if mu is None or len(mu) != 6:
+            mu = [float('nan')] * 6
+
+        # Track S11 for plotting/correlation
+        y_list.append(cell_dark[0])
+        mu_list.append(mu[0])
 
         # intended command for this frame
         current_level = int(u_seq[frame_idx])
@@ -400,71 +397,57 @@ def main(exposure_ms, gain):
         if frame_idx > 0:
             prev_level = int(u_seq[frame_idx - 1])
             if current_level != prev_level:
-                write_test_light(TEST_LIGHT_NAME, current_level)
+                write_test_light(light_name, current_level)
 
-        # log row
+        # log row (mu + 6 sector %dark)
         writer.writerow([
             frame_idx,
             round(now_s, 6),
             round(dt_s, 6),
             current_level,
             current_bit,
-            round(y_metric, 4),
-            round(y_mean,   3),
-            round(y_std,    3),
-            round(y_p10,    3),
-            round(y_p90,    3),
-            round(sat_lo,   3),
-            round(sat_hi,   3),
+            round(float(mu[0]), 4),  # mu_S11
+            round(float(mu[1]), 4),  # mu_S12
+            round(float(mu[2]), 4),  # mu_S21
+            round(float(mu[3]), 4),  # mu_S22
+            round(float(mu[4]), 4),  # mu_S31
+            round(float(mu[5]), 4),  # mu_S32
+            round(float(cell_dark[0]), 4),  # y_S11
+            round(float(cell_dark[1]), 4),  # y_S12
+            round(float(cell_dark[2]), 4),  # y_S21
+            round(float(cell_dark[3]), 4),  # y_S22
+            round(float(cell_dark[4]), 4),  # y_S31
+            round(float(cell_dark[5]), 4),  # y_S32
             frame_drop_flag
         ])
 
         # progress every ~60 frames
         if frame_idx % 60 == 0 and frame_idx != 0:
-            print(f"[LOOP] frame={frame_idx}, t={now_s:.1f}s, y={y_metric:.1f}")
+            print(f"[LOOP] frame={frame_idx}, t={now_s:.1f}s, S11_dark={cell_dark[0]:.1f}, mu_S11={mu[0]:.1f}")
 
     # end loop
 
     cap.release()
     csvfile.close()
 
-    # 6. Correlation-based delay estimate
+    # 6. Correlation-based *causal* delay estimate (using S11 series)
     t_arr = np.array(frame_times, dtype=float)
     u_arr = u_seq[:len(frame_times)].astype(float)
     y_arr = np.array(y_list[:len(frame_times)], dtype=float)
 
-    lag_s = 0.0
-    if len(t_arr) > 3:
-        def z(v):
-            v = np.array(v, dtype=float)
-            v = v - np.mean(v)
-            s = np.std(v) + 1e-9
-            return v / s
-        u_n = z(u_arr)
-        y_n = z(y_arr)
-
-        corr = correlate(y_n, u_n, mode="full")
-        lags = np.arange(-len(u_n)+1, len(u_n))
-        best_idx = int(np.argmax(corr))
-        best_lag_frames = lags[best_idx]
-
-        if len(t_arr) > 1:
-            Ts = np.median(np.diff(t_arr))
-        else:
-            Ts = 1.0 / 30.0
-        lag_s = best_lag_frames * Ts
+    lag_s = causal_lag_seconds(u_arr, y_arr, t_arr)
 
     print(f"[DONE] Captured {len(t_arr)} samples")
-    print(f"[DONE] Delay ≈ {lag_s:.3f}s")
+    print(f"[DONE] Causal delay (S11) ≈ {lag_s:.3f}s")
     print(f"[DONE] CSV saved: {csv_path}")
 
-    # 7. Plot and save
+    # 7. Plot and save (S11 %dark vs command)
     plt.figure(figsize=(8,4))
     plt.plot(t_arr, u_arr, label="u_dac (command)")
-    plt.plot(t_arr, y_arr, label="%dark (y_metric)")
+    plt.plot(t_arr, y_arr, label="y_S11 (%dark)")
     plt.xlabel("time [s]")
     plt.ylabel("signal level / %dark")
-    plt.title(f"SystemID run {timestamp_str}  (lag ≈ {lag_s:.3f}s)")
+    plt.title(f"{light_name}  col={col} ch={ch}  {timestamp_str}  (causal lag ≈ {lag_s:.3f}s)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -473,21 +456,51 @@ def main(exposure_ms, gain):
 
     print(f"[DONE] Plot saved: {png_path}")
 
+    # 8. Zero after this light's run
+    zero_all_lights()
+    time.sleep(getattr(C, "SWITCH_SETTLE_S", 0.05))
+
 # ------------------------------------------------------------
-# Interactive menu (only caller of main())
+# NEW: run all lights sequentially (data collection only)
+# ------------------------------------------------------------
+def get_all_lights_sorted():
+    # sort by (column, channel, name) so logs group physically
+    items = []
+    for name, (col, ch) in PIDPolicy.CHANNEL_MAP.items():
+        items.append((col, ch, name))
+    items.sort()
+    return [name for (_, _, name) in items]
+
+def run_all_lights(exposure_ms: float, gain: float):
+    names = get_all_lights_sorted()
+    print("\n[RUN-ALL] Sequence:", ", ".join(names))
+    for i, ln in enumerate(names, 1):
+        print(f"\n[RUN-ALL] {i}/{len(names)}  -> {ln}")
+        try:
+            run_single_light(ln, exposure_ms, gain)
+        except KeyboardInterrupt:
+            print("[RUN-ALL] Interrupted by user.")
+            break
+        except Exception as e:
+            print(f"[RUN-ALL] Error on light '{ln}': {e}")
+    print("\n[RUN-ALL] Complete.")
+
+# ------------------------------------------------------------
+# Interactive menu
 # ------------------------------------------------------------
 def interactive_menu():
     """
     Simple TUI loop:
+    - run ALL lights (sequentially)
+    - run ONE light (uses TEST_LIGHT_NAME)
     - tweak test params
-    - run a capture
     - view latest plot
     - zero all lights
     - exit cleanly
     """
-    global DARK_THRESH, HIGH_VAL, LOW_VAL, RUN_SECONDS, STIM_HOLD_FRAMES
+    global DARK_THRESH, HIGH_VAL, LOW_VAL, RUN_SECONDS, STIM_HOLD_FRAMES, TEST_LIGHT_NAME
 
-    # These are live-tunable and get passed into main()
+    # These are live-tunable and get passed into runs
     exposure_ms = 8.0
     gain        = 10.0
 
@@ -495,78 +508,86 @@ def interactive_menu():
         print("\n============================")
         print("🔧 System ID Interactive Menu")
         print("============================")
-        print(f"1) Run test                (current run time = {RUN_SECONDS:.1f}s)")
-        print(f"2) Set exposure time       (current = {exposure_ms:.2f} ms)")
-        print(f"3) Set gain                (current = {gain})")
-        print(f"4) Set dark pixel thresh   (current = {DARK_THRESH})")
-        print(f"5) Set HIGH DAC value      (current = {HIGH_VAL})")
-        print(f"6) Set LOW DAC value       (current = {LOW_VAL})")
-        print(f"7) Set run duration        (current = {RUN_SECONDS:.1f}s)")
-        print("8) Show last plot")
-        print("9) Zero all lights")
+        print(f"1) Run ALL lights          (each ~{RUN_SECONDS:.1f}s)")
+        print(f"2) Run ONE light           (current = {TEST_LIGHT_NAME})")
+        print(f"3) Set exposure time       (current = {exposure_ms:.2f} ms)")
+        print(f"4) Set gain                (current = {gain})")
+        print(f"5) Set dark pixel thresh   (current = {DARK_THRESH})")
+        print(f"6) Set HIGH DAC value      (current = {HIGH_VAL})")
+        print(f"7) Set LOW DAC value       (current = {LOW_VAL})")
+        print(f"8) Set run duration        (current = {RUN_SECONDS:.1f}s)")
+        print("9) Show last plot")
+        print("A) Zero all lights")
         print("0) Exit")
-        choice = input("Select option: ").strip()
+        choice = input("Select option: ").strip().upper()
 
         if choice == "1":
-            print("\n▶ Running test...\n")
-
-            # try to lock manual exposure *again* right before run so you see crash ASAP
-            # this call is duplicated in main() (which will also crash if it fails),
-            # but seeing it here too is nice feedback.
+            print("\n▶ Running ALL lights...\n")
             try:
-                EC.set_exposure_manual(
-                    exposure_ms=exposure_ms,
-                    gain=gain,
-                    dev=CAM_DEVICE
-                )
+                # lock manual exposure before runs so failure is immediate
+                EC.set_exposure_manual(exposure_ms=exposure_ms, gain=gain, dev=CAM_DEVICE)
                 print(f"[OV9281] Manual exposure pre-run: {exposure_ms:.2f} ms, gain={gain}")
             except Exception as e:
                 print("[FATAL] Could not set manual exposure BEFORE run.")
                 print("       You are NOT collecting valid data.")
                 print(f"       Error from ExposureControl: {e}")
-                # don't run the test at all if this fails
                 continue
-
-            # run one test using current local exposure_ms/gain
-            main(exposure_ms, gain)
+            run_all_lights(exposure_ms, gain)
 
         elif choice == "2":
+            print("\n▶ Running ONE light...\n")
+            # keep the quick single-light path for ad-hoc checks
+            try:
+                EC.set_exposure_manual(exposure_ms=exposure_ms, gain=gain, dev=CAM_DEVICE)
+                print(f"[OV9281] Manual exposure pre-run: {exposure_ms:.2f} ms, gain={gain}")
+            except Exception as e:
+                print("[FATAL] Could not set manual exposure BEFORE run.")
+                print("       You are NOT collecting valid data.")
+                print(f"       Error from ExposureControl: {e}")
+                continue
+            # allow on-the-fly selection
+            name_in = input(f"Enter light name (blank = {TEST_LIGHT_NAME}): ").strip()
+            if name_in:
+                TEST_LIGHT_NAME = name_in
+            run_single_light(TEST_LIGHT_NAME, exposure_ms, gain)
+
+        elif choice == "3":
             try:
                 exposure_ms = float(input("Enter exposure time (ms): ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "3":
+        elif choice == "4":
             try:
                 gain = float(input("Enter gain value: ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "4":
+        elif choice == "5":
             try:
                 DARK_THRESH = int(input("Enter dark pixel threshold (0–255): ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "5":
+        elif choice == "6":
             try:
                 HIGH_VAL = int(input("Enter HIGH DAC value (0–255): ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "6":
+        elif choice == "7":
             try:
                 LOW_VAL = int(input("Enter LOW DAC value (0–255): ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "7":
+        elif choice == "8":
             try:
                 RUN_SECONDS = float(input("Enter run duration (s): ").strip())
             except ValueError:
                 print("Invalid number.")
 
-        elif choice == "8":
+        elif choice == "9":
             latest = sorted(glob.glob("logs/idlog_*.png"))
             if not latest:
                 print("No plots found.")
@@ -578,7 +599,7 @@ def interactive_menu():
                 except Exception as e:
                     print(f"Could not open image viewer: {e}")
 
-        elif choice == "9":
+        elif choice == "A":
             zero_all_lights()
 
         elif choice == "0":
