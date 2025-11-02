@@ -6,10 +6,13 @@ Fast, mono-camera system-identification test for ICLS lighting.
 - Uses Config.ANALYSIS_CAMERA_INDEX to open the correct /dev/videoX
 - Forces mono (Y8) capture for the OV9281 analysis cam
 - Generates a random-telegraph stimulus (high/low DAC)
-- Logs rich per-frame data with metadata header (now logs 6 sector metrics + 6 sector means)
-- Estimates delay via *causal* correlation (|corr|, lags >= 0) using S11 only for y[]
-- NEW: Runs every mapped light sequentially; zeros all lights between tests
-- NEW: Labels logs with light name, column, and channel for MATLAB post-processing
+- Logs per-frame data with metadata header
+    * %dark per sector: y_S11..y_S32
+    * mean brightness per sector: mu_S11..mu_S32  (linear, 0..255)
+- Estimates delay via *causal* correlation (|corr|, lags >= 0)
+- Auto-selects the sector/signal (mu or %dark) with strongest response for reporting/plot
+- Runs every mapped light sequentially; zeros all lights between tests
+- Labels logs with light name, column, and channel for MATLAB post-processing
 """
 
 import os, sys, time, csv, signal, glob, subprocess
@@ -42,11 +45,14 @@ STIM_HOLD_FRAMES = 3         # how many frames each bit is held
 HIGH_VAL = 200               # DAC high level
 LOW_VAL  = 0                 # DAC low level
 DARK_THRESH = 20             # pixel < thresh counted as "dark"
-# default single-light selection for "Run one light" menu option:
-TEST_LIGHT_NAME = "HS22"
+TEST_LIGHT_NAME = "HS22"     # default for single-light run
 
 CAM_INDEX = int(C.ANALYSIS_CAMERA_INDEX)  # from your Config module
 CAM_DEVICE = f"/dev/video{CAM_INDEX}"
+
+COOLDOWN_BETWEEN_LIGHTS_S = 0.25          # small pause to keep driver happy
+EST_FPS = 30.0                             # used to size stimulus; lag uses actual dt afterwards
+SECTOR_NAMES = ["S11","S12","S21","S22","S31","S32"]
 
 # ------------------------------------------------------------
 # SIGINT handler
@@ -100,6 +106,47 @@ def zero_all_lights():
         print(f"[ERR] Failed to zero lights: {e}")
 
 # ------------------------------------------------------------
+# Camera helper: open with retry + warm-up
+# ------------------------------------------------------------
+def open_camera_with_retry(index, *, width=640, height=360,
+                           fourccs=("Y800","GREY"),
+                           max_open_tries=3, warmup_grabs=8):
+    for attempt in range(1, max_open_tries+1):
+        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            time.sleep(0.2)
+            continue
+        try:
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        except Exception:
+            pass
+        ok_fourcc = False
+        for code in fourccs:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*code))
+            if int(cap.get(cv2.CAP_PROP_FOURCC)) != 0:
+                ok_fourcc = True
+                break
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        # warm-up: grab a few frames to let V4L2 settle
+        good = 0
+        for _ in range(warmup_grabs):
+            ok, _ = cap.read()
+            if ok:
+                good += 1
+            else:
+                time.sleep(0.02)
+        if good >= max(3, warmup_grabs//2):
+            return cap  # success
+
+        # otherwise retry from scratch
+        cap.release()
+        time.sleep(0.2)
+    return None
+
+# ------------------------------------------------------------
 # Frame reshape helpers & stimulus
 # ------------------------------------------------------------
 def reshape_if_flat_ov9281(frame):
@@ -138,9 +185,6 @@ def reshape_if_flat_ov9281(frame):
     # Already 2-D in a sane way, just return
     return frame
 
-def rand_telegraph(length: int) -> np.ndarray:
-    return np.where(np.random.rand(length) < 0.5, -1, +1).astype(np.int8)
-
 def build_stim_sequence(low_val, high_val, hold_frames, run_seconds, est_fps, mode="rand_telegraph"):
     """
     Returns:
@@ -166,7 +210,7 @@ def build_stim_sequence(low_val, high_val, hold_frames, run_seconds, est_fps, mo
     return u_seq.astype(np.int16), stim_bits.astype(np.int8)
 
 # ------------------------------------------------------------
-# NEW: sector mean brightness helper (linear observable, 0..255)
+# Sector mean brightness helper (linear observable, 0..255)
 # ------------------------------------------------------------
 def sector_means(frame, rows=3, cols=2):
     """Compute mean brightness per sector on a rows×cols grid."""
@@ -186,24 +230,37 @@ def sector_means(frame, rows=3, cols=2):
     return out  # len 6
 
 # ------------------------------------------------------------
-# NEW: causal lag estimate (|corr|, lags >= 0)
+# Causal correlation helpers
 # ------------------------------------------------------------
 def causal_lag_seconds(u_arr: np.ndarray, y_arr: np.ndarray, t_arr: np.ndarray) -> float:
+    """Return causal (>=0) lag in seconds that maximizes |corr(y,u)|."""
     if len(t_arr) < 3 or len(u_arr) < 3 or len(y_arr) < 3:
         return 0.0
-    # z-normalize
     u = (u_arr - np.mean(u_arr)) / (np.std(u_arr) + 1e-9)
     y = (y_arr - np.mean(y_arr)) / (np.std(y_arr) + 1e-9)
     corr = correlate(y, u, mode="full")
     lags = np.arange(-len(u) + 1, len(u))
-    # causal mask
     mask = lags >= 0
     if not np.any(mask):
         return 0.0
     best_idx = int(np.argmax(np.abs(corr[mask])))
     best_lag_frames = int(lags[mask][best_idx])
-    Ts = np.median(np.diff(t_arr)) if len(t_arr) > 1 else (1.0 / 30.0)
+    Ts = np.median(np.diff(t_arr)) if len(t_arr) > 1 else (1.0 / EST_FPS)
     return float(best_lag_frames * Ts)
+
+def peak_abs_corr_and_lag(u_arr: np.ndarray, y_arr: np.ndarray):
+    """Return (peak_abs_corr, best_lag_frames) with causal (>=0) constraint."""
+    if len(u_arr) < 3 or len(y_arr) < 3:
+        return 0.0, 0
+    u = (u_arr - np.mean(u_arr)) / (np.std(u_arr) + 1e-9)
+    y = (y_arr - np.mean(y_arr)) / (np.std(y_arr) + 1e-9)
+    corr = correlate(y, u, mode="full")
+    lags = np.arange(-len(u) + 1, len(u))
+    mask = lags >= 0
+    if not np.any(mask):
+        return 0.0, 0
+    idx = int(np.argmax(np.abs(corr[mask])))
+    return float(np.abs(corr[mask][idx])), int(lags[mask][idx])
 
 # ------------------------------------------------------------
 # Core data run (single light)
@@ -213,13 +270,15 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     Run one identification capture for a single light:
     - locks exposure (hard fail if we can't)
     - generates stimulus u_seq
-    - logs per-frame data to CSV with metadata header (S11..S32 %dark + mu_Sxx brightness)
-    - saves plot and prints delay estimate (causal |corr|, S11 only)
+    - writes initial DAC before camera read (so the light toggles even if first read stalls)
+    - robust camera open with warm-up and per-frame read retries
+    - logs mu and %dark per sector
+    - auto-picks best responding sector/signal for delay estimate and plot
     """
     global DARK_THRESH, HIGH_VAL, LOW_VAL, RUN_SECONDS, STIM_HOLD_FRAMES
 
     if light_name not in PIDPolicy.CHANNEL_MAP:
-        print(f"[ERR] Unknown light '{light_name}'. Skipping.")
+        print(f("[ERR] Unknown light '{light_name}'. Skipping."))
         return
 
     col, ch = PIDPolicy.CHANNEL_MAP[light_name]
@@ -231,7 +290,7 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     zero_all_lights()
     time.sleep(getattr(C, "SWITCH_SETTLE_S", 0.05))
 
-    # 1. Force manual exposure. NO try/except: if this fails we WANT to die.
+    # 1. Force manual exposure (hard fail is OK)
     EC.set_exposure_manual(
         exposure_ms=exposure_ms,
         gain=gain,
@@ -239,45 +298,7 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     )
     print(f"[OV9281] Manual exposure: {exposure_ms:.2f} ms, gain={gain}")
 
-    # 2. Open camera
-    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        print(f"[ERR] Could not open camera index {CAM_INDEX} ({CAM_DEVICE})")
-        return
-
-    # request raw mono so OpenCV doesn't auto-convert to RGB
-    try:
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-    except Exception:
-        pass
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"Y800"))
-    if int(cap.get(cv2.CAP_PROP_FOURCC)) == 0:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"GREY"))
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-
-    # one test frame just to learn shape / mono-ness
-    ok, test_frame = cap.read()
-    if not ok or test_frame is None:
-        print("[ERR] Camera failed first capture")
-        cap.release()
-        return
-
-    test_frame = reshape_if_flat_ov9281(test_frame)
-
-    h0, w0 = test_frame.shape[:2]
-    is_mono = (test_frame.ndim == 2) or (test_frame.ndim == 3 and test_frame.shape[2] == 1)
-    chans = 1 if is_mono else (test_frame.shape[2] if test_frame.ndim == 3 else 1)
-
-    print(f"[INIT] Camera OK {w0}x{h0} — {'MONO' if is_mono else 'COLOR'} ({chans}ch)")
-
-    # 2b. Instantiate the LightingAnalyzer (3×2) for %dark
-    analyzer = LightingAnalyzer(threshold_value=DARK_THRESH, rows=3, cols=2)
-    print(f"[INIT] Using LightingAnalyzer (3r, 2c) with thresh={DARK_THRESH}")
-
-    # 3. Build the stimulus sequence we plan to apply
-    EST_FPS = 30.0
+    # 2. Build the stimulus sequence we plan to apply (using EST_FPS)
     u_seq, stim_bits = build_stim_sequence(
         low_val=LOW_VAL,
         high_val=HIGH_VAL,
@@ -288,6 +309,39 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     )
     total_target_frames = len(u_seq)
     print(f"[INIT] u_seq length={total_target_frames}, preview={u_seq[:20]}")
+
+    # 2b. Set initial DAC level *before* touching the camera so the light will trigger
+    current_level = int(u_seq[0])
+    write_test_light(light_name, current_level)
+    time.sleep(getattr(C, "SWITCH_SETTLE_S", 0.05))
+
+    # 3. Open camera with retry + warmup
+    cap = open_camera_with_retry(CAM_INDEX, width=640, height=360)
+    if cap is None:
+        print("[ERR] Could not open/prime camera after retries.")
+        zero_all_lights()
+        time.sleep(COOLDOWN_BETWEEN_LIGHTS_S)
+        return
+
+    # one test frame to learn shape / mono-ness (should succeed after warmup)
+    ok, test_frame = cap.read()
+    if not ok or test_frame is None:
+        print("[ERR] Camera failed initial capture after warmup.")
+        cap.release()
+        zero_all_lights()
+        time.sleep(COOLDOWN_BETWEEN_LIGHTS_S)
+        return
+
+    test_frame = reshape_if_flat_ov9281(test_frame)
+
+    h0, w0 = test_frame.shape[:2]
+    is_mono = (test_frame.ndim == 2) or (test_frame.ndim == 3 and test_frame.shape[2] == 1)
+    chans = 1 if is_mono else (test_frame.shape[2] if test_frame.ndim == 3 else 1)
+    print(f"[INIT] Camera OK {w0}x{h0} — {'MONO' if is_mono else 'COLOR'} ({chans}ch)")
+
+    # 3b. Instantiate the LightingAnalyzer (3×2) for %dark
+    analyzer = LightingAnalyzer(threshold_value=DARK_THRESH, rows=3, cols=2)
+    print(f"[INIT] Using LightingAnalyzer (3r, 2c) with thresh={DARK_THRESH}")
 
     # 4. Prep logging
     os.makedirs("logs", exist_ok=True)
@@ -318,7 +372,7 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     for k, v in meta.items():
         csvfile.write(f"# {k}: {v}\n")
 
-    # NEW CSV header: add mu_Sxx (mean brightness)
+    # CSV header (mu first, then %dark; matches earlier version so MATLAB is easy)
     writer.writerow([
         "frame_idx","t_s","dt_s",
         "u_dac","stim_bit",
@@ -333,15 +387,14 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
     print("[LOOP] Starting acquisition...")
 
     frame_times = []
-    y_list = []   # S11 %dark series for plotting/correlation
-    mu_list = []  # S11 mean brightness (optional visual later)
+    # full traces for all sectors
+    y_lists  = [[] for _ in range(6)]   # %dark per sector
+    mu_lists = [[] for _ in range(6)]   # mean brightness per sector
+
     t_start = time.perf_counter()
     frame_idx = -1
 
-    # set initial DAC level before loop
-    current_level = int(u_seq[0])
-    write_test_light(light_name, current_level)
-
+    # initial DAC already set; proceed
     while True:
         frame_idx += 1
         if frame_idx >= total_target_frames:
@@ -350,8 +403,12 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
 
         ok, frame = cap.read()
         if not ok or frame is None:
-            print("[WARN] dropped frame from camera")
-            continue
+            # one quick retry after a short nap
+            time.sleep(0.01)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("[WARN] dropped frame from camera")
+                continue
 
         frame = reshape_if_flat_ov9281(frame)
 
@@ -385,9 +442,10 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
         if mu is None or len(mu) != 6:
             mu = [float('nan')] * 6
 
-        # Track S11 for plotting/correlation
-        y_list.append(cell_dark[0])
-        mu_list.append(mu[0])
+        # accumulate traces for all sectors
+        for k in range(6):
+            y_lists[k].append(float(cell_dark[k]))
+            mu_lists[k].append(float(mu[k]))
 
         # intended command for this frame
         current_level = int(u_seq[frame_idx])
@@ -423,30 +481,59 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
 
         # progress every ~60 frames
         if frame_idx % 60 == 0 and frame_idx != 0:
-            print(f"[LOOP] frame={frame_idx}, t={now_s:.1f}s, S11_dark={cell_dark[0]:.1f}, mu_S11={mu[0]:.1f}")
+            print(f"[LOOP] frame={frame_idx}, t={now_s:.1f}s, "
+                  f"S11_dark={cell_dark[0]:.1f}, mu_S11={mu[0]:.1f}")
 
     # end loop
 
-    cap.release()
-    csvfile.close()
-
-    # 6. Correlation-based *causal* delay estimate (using S11 series)
+    # 6. Correlation-based *causal* delay estimate using best sector/signal
     t_arr = np.array(frame_times, dtype=float)
     u_arr = u_seq[:len(frame_times)].astype(float)
-    y_arr = np.array(y_list[:len(frame_times)], dtype=float)
 
-    lag_s = causal_lag_seconds(u_arr, y_arr, t_arr)
+    # Build 6 arrays for %dark and mu, truncated to captured frames
+    Y = [np.array(y_lists[k], dtype=float) for k in range(6)]
+    M = [np.array(mu_lists[k], dtype=float) for k in range(6)]
+
+    # Choose the strongest response across both mu and y, causal-only
+    best = {"kind": None, "sector_idx": 0, "peak": -1.0, "lag_frames": 0}
+    for k in range(6):
+        peak_y, lag_y = peak_abs_corr_and_lag(u_arr, Y[k])
+        if peak_y > best["peak"]:
+            best = {"kind": "y", "sector_idx": k, "peak": peak_y, "lag_frames": lag_y}
+        peak_m, lag_m = peak_abs_corr_and_lag(u_arr, M[k])
+        if peak_m > best["peak"]:
+            best = {"kind": "mu", "sector_idx": k, "peak": peak_m, "lag_frames": lag_m}
+
+    # compute lag seconds for the chosen trace
+    if best["kind"] == "mu":
+        chosen = M[best["sector_idx"]]
+        ylabel = f"mu_{SECTOR_NAMES[best['sector_idx']]}"
+    else:
+        chosen = Y[best["sector_idx"]]
+        ylabel = f"y_{SECTOR_NAMES[best['sector_idx']]} (%dark)"
+    lag_s = causal_lag_seconds(u_arr, chosen, t_arr)
+
+    # Append quick sanity info for MATLAB at the *end* of the CSV
+    csvfile.write(f"# selected_signal: {best['kind']}\n")
+    csvfile.write(f"# selected_sector: {SECTOR_NAMES[best['sector_idx']]}\n")
+    csvfile.write(f"# selected_peak_corr: {best['peak']:.6f}\n")
+    csvfile.write(f"# selected_lag_s: {lag_s:.6f}\n")
+
+    print(f"[CHECK] strongest response: {ylabel}, corr={best['peak']:.3f}, lag≈{lag_s:.3f}s")
+
+    csvfile.close()
+    cap.release()
 
     print(f"[DONE] Captured {len(t_arr)} samples")
-    print(f"[DONE] Causal delay (S11) ≈ {lag_s:.3f}s")
+    print(f"[DONE] Causal delay ({ylabel}) ≈ {lag_s:.3f}s")
     print(f"[DONE] CSV saved: {csv_path}")
 
-    # 7. Plot and save (S11 %dark vs command)
+    # 7. Plot and save (chosen signal vs command)
     plt.figure(figsize=(8,4))
     plt.plot(t_arr, u_arr, label="u_dac (command)")
-    plt.plot(t_arr, y_arr, label="y_S11 (%dark)")
+    plt.plot(t_arr, chosen, label=ylabel)
     plt.xlabel("time [s]")
-    plt.ylabel("signal level / %dark")
+    plt.ylabel("signal level")
     plt.title(f"{light_name}  col={col} ch={ch}  {timestamp_str}  (causal lag ≈ {lag_s:.3f}s)")
     plt.grid(True)
     plt.legend()
@@ -456,12 +543,12 @@ def run_single_light(light_name: str, exposure_ms: float, gain: float):
 
     print(f"[DONE] Plot saved: {png_path}")
 
-    # 8. Zero after this light's run
+    # 8. Zero after this light's run and short cooldown
     zero_all_lights()
-    time.sleep(getattr(C, "SWITCH_SETTLE_S", 0.05))
+    time.sleep(COOLDOWN_BETWEEN_LIGHTS_S)
 
 # ------------------------------------------------------------
-# NEW: run all lights sequentially (data collection only)
+# Run all lights sequentially (data collection only)
 # ------------------------------------------------------------
 def get_all_lights_sorted():
     # sort by (column, channel, name) so logs group physically
@@ -492,9 +579,9 @@ def interactive_menu():
     """
     Simple TUI loop:
     - run ALL lights (sequentially)
-    - run ONE light (uses TEST_LIGHT_NAME)
+    - run ONE light (uses TEST_LIGHT_NAME or user input)
     - tweak test params
-    - view latest plot
+    - show last plot
     - zero all lights
     - exit cleanly
     """
@@ -536,7 +623,6 @@ def interactive_menu():
 
         elif choice == "2":
             print("\n▶ Running ONE light...\n")
-            # keep the quick single-light path for ad-hoc checks
             try:
                 EC.set_exposure_manual(exposure_ms=exposure_ms, gain=gain, dev=CAM_DEVICE)
                 print(f"[OV9281] Manual exposure pre-run: {exposure_ms:.2f} ms, gain={gain}")
@@ -545,7 +631,6 @@ def interactive_menu():
                 print("       You are NOT collecting valid data.")
                 print(f"       Error from ExposureControl: {e}")
                 continue
-            # allow on-the-fly selection
             name_in = input(f"Enter light name (blank = {TEST_LIGHT_NAME}): ").strip()
             if name_in:
                 TEST_LIGHT_NAME = name_in
