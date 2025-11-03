@@ -12,27 +12,24 @@ channel_map = {
     'e': 5,
     'f': 6,
     'g': 7,
-    'h': 8
+    'h': 8,
 }
 
 def main():
     while True:
         print("\nAvailable channels: A, B, C, D, E, F, G, H")
-        choice = input("Enter the DAC channel to test (A–H): ").strip().lower()
+        choice = input("Enter Y to send all channels high: ").strip().lower()
 
-        if choice not in channel_map:
-            print("Invalid input. Please enter a letter A through H.")
-            continue
-
-        # Drive that channel to 255 (full scale) for 5 seconds
-        ch_num = channel_map[choice]
-        print(f"\nSetting channel {choice.upper()} (#{ch_num}) to 255.")
-        update_dac(255, ch_num)
+        # Drive all channels to 255 (full scale) for 5 seconds
+        print(f"\nSetting channels to 255.")
+        for channel in channel_map.values():
+            update_dac(255, channel)
         time.sleep(5)
 
         # Turn the channel off (0)
-        print(f"Turning off channel {choice.upper()} (#{ch_num}).")
-        update_dac(0, ch_num)
+        print(f"Turning off channels.")
+        for channel in channel_map.values():
+            update_dac(0, channel)
 
         # Prompt user to continue or exit
         again = input("Test another channel? (y/n): ").strip().lower()
