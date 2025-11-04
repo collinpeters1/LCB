@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+env/
+*/.venv/
+*/venv/
+*/env/
+
+# Python cache and build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.log
+*.tmp
+
+# IDE & system files
+.vscode/
+.idea/
+.DS_Store
+
+# Generated artifacts
+build/
+dist/
+*.egg-info/
+
+# Project-specific generated data
+SeniorDesignProject/Re_ system_id_code_batch2/
+**/*.mat
+**/*.png
