@@ -58,8 +58,8 @@ PROFILES = {
     "Lunar": {
         "exposure": "manual",     # lock exposure
         "exposure_ms": 15.0,      # ~15 ms works with 60 fps; adjust 12–16.7 as needed
-        "gain": 10,               # small fixed analog gain to lift shadows, tweak 0–20
-        "threshold": 70,          # higher cutoff to separate shadows
+        "gain": None,               # small fixed analog gain to lift shadows, tweak 0–20
+        "threshold": 30,          # higher cutoff to separate shadows
         "otsu": False,            # keep off unless you want a fallback
     },
 }
@@ -93,4 +93,4 @@ def cycle_profile(current_name: str, analyzer, dev: str = EXPO_DEV) -> str:
     idx = PROFILE_ORDER.index(current_name) if current_name in PROFILE_ORDER else 0
     new = PROFILE_ORDER[(idx + 1) % len(PROFILE_ORDER)]
     apply_profile(new, analyzer, dev)
-    return new90
+    return new

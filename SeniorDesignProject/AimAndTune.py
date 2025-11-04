@@ -1,12 +1,47 @@
-
 #!/usr/bin/env python3
-#AimAndTune.py
+# AimAndTune.py
 import cv2
 import time
 import spidev
 import numpy as np
+from pathlib import Path
+from datetime import datetime
 
 from modules.LightingAnalysis import CameraManager, LightingAnalyzer
+
+# ---------------- Screenshot helper ----------------
+def save_frame_safely(img, out_dir="/home/lcb/github.com/PID_venv/SeniorDesignProject/captures", prefix="aim"):
+    """
+    Save a frame (NumPy array) as a PNG with a timestamped filename.
+    Creates the output directory if needed and handles dtype issues.
+
+    Returns the saved path (str) on success, or None on failure.
+    """
+    if img is None:
+        print("[ERROR] Cannot save frame: image is None.")
+        return None
+
+    # Ensure uint8 image (gracefully handle floats or other dtypes)
+    if img.dtype != np.uint8:
+        maxv = float(np.max(img)) if img.size else 1.0
+        if np.issubdtype(img.dtype, np.floating):
+            scale = 255.0 if maxv <= 1.0 else 1.0
+            img = np.clip(img * scale, 0, 255).astype(np.uint8)
+        else:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(out_dir) / f"{prefix}_{ts}.png"
+
+    ok = cv2.imwrite(str(path), img)
+    if ok:
+        print(f"[INFO] Saved screenshot → {path}")
+        return str(path)
+    else:
+        print("[ERROR] cv2.imwrite() failed!")
+        
+        return None
 
 # ---------------- DAC interface ----------------
 SPI_BUS = 1
@@ -74,6 +109,7 @@ def draw_hud(annotated_img, active_col, active_idx, state, analyzer):
     - DAC column and channel currently selected
     - Current DAC values for both columns
     - Threshold mode / value
+    - Quick controls
     over the analyzed/annotated frame.
     """
     hud_lines = []
@@ -101,7 +137,7 @@ def draw_hud(annotated_img, active_col, active_idx, state, analyzer):
 
     # Controls reminder (short version so it fits)
     hud_lines.append("1/2 col  a/d chan  w/W +1/+25  s/S -1/-25  space toggle")
-    hud_lines.append("[ ] thr  \\ mode  x/X zero 0 off = max  q quit")
+    hud_lines.append("[ ] thr  \\ mode  p save  x/X zero 0 off = max  q quit")
 
     x0 = 10
     y0 = 20
@@ -159,6 +195,7 @@ def main():
     print("  X             zero both columns")
     print("  [ / ]         threshold -5 / +5")
     print("  \\             toggle threshold_mode global <-> local_otsu")
+    print("  p             save annotated screenshot to ./captures/")
     print("  q             quit\n")
 
     try:
@@ -172,7 +209,6 @@ def main():
             overall_dark, cell_darkness, annotated_img = analyzer.analyze(frame)
 
             # annotate darkness numbers in console (optional)
-            # you can comment this out if it's too spammy live
             print(
                 f"Overall {overall_dark:.1f}% | "
                 f"S11={cell_darkness[0]:.1f} "
@@ -288,6 +324,10 @@ def main():
                 # toggle global/local_otsu thresholding
                 new_mode = "local_otsu" if analyzer.threshold_mode == "global" else "global"
                 analyzer.set_threshold_mode(new_mode)
+
+            # save annotated screenshot
+            elif key in (ord('p'), ord('P')):
+                save_frame_safely(annotated_img, out_dir="captures", prefix="analysis")
 
             # loop timing
             time.sleep(0.01)

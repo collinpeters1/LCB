@@ -21,7 +21,7 @@ WINDOW_HDR = "HDR Feed (CSI)"
 
 # Timing
 # original value = 0.05
-LOOP_SLEEP_S = 0.001
+LOOP_SLEEP_S = 0.05
 SWITCH_SETTLE_S = 0.05
 
 # Keys

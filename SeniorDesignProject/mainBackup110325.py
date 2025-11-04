@@ -7,6 +7,7 @@ from modules.LightingAnalysis import CameraManager, LightingAnalyzer
 from modules.DualPicam import PicamFeed
 from modules.UPS import get_ups_data
 from modules.ModeSwitches import ModeSwitches
+#from modules.LightPolicy import init_state, reset_all, step_and_apply
 from modules.PIDPolicy import init_state, reset_all, pid_step_and_apply, PIDManager
 from modules.OverlayRenderer import draw_analysis
 from modules.HDRView import ensure_active as hdr_ensure_active, capture_frame as hdr_capture_frame, show as hdr_show
@@ -22,26 +23,36 @@ def main():
     switches = ModeSwitches(auto_pin=C.AUTO_PIN, dn_pin=C.DN_PIN, dn_debounce_ms=C.DN_DEBOUNCE_MS)
     analysis_cam = CameraManager(camera_index=C.ANALYSIS_CAMERA_INDEX)
 
+    # LAZY INIT: don't construct either HDR cam yet
     active_name = C.HDR_DAY_NAME
     hdr_cam_primary = None
     hdr_cam_alt = None
 
     analyzer = LightingAnalyzer(threshold_value=C.THRESHOLD_DARK, rows=3, cols=2)
 
+    # PID POLICY CHANGES - COMMENT IN/OUT AS NECESSARY
+
     dac = init_state()
+    #ADDING PID FUNCTION IN HERE
     pid = PIDManager(
-        kp=1.2, ki=2.4, kd=0.045,
-        sample_time=C.LOOP_SLEEP_S / 10,
+        #kp=18.577,	 ki = 103.91, kd = 0.796,
+        kp=1.2, ki = 2.4, kd = 0.045,
+        #kp=.4, ki = 0.1, kd = 0.00, - STEADY STATE
+        #kp=1.5, ki = 0.23, kd = 0.05,
+        sample_time = C.LOOP_SLEEP_S/10,
         slew_per_step=3.0,
         deadband=2.0
-    )
+        )
+    #checking the sample time
     print("PID Sample_time =", next(iter(pid.pids.values())).sample_time)
-
+    
     emer = EmergencyController()
     prev_auto_mode = None  # track for just_switched_to_auto
 
+    # --- NEW: runtime-adjustable darkness cutoff (starts from config) ---
     dark_cutoff = int(clamp(C.THRESHOLD_DARK, 0, 100))  # percent 0..100
 
+    # Start in Classroom profile
     current_profile = PROFILE_ORDER[0]
     apply_profile(current_profile, analyzer)
     exposure_locked = (PROFILES[current_profile]["exposure"] == "manual")
@@ -60,8 +71,8 @@ def main():
     try:
         while True:
             states = switches.read_states()
-            auto_mode = states["auto_mode"]
-            dn_state = states["dn_state"]
+            auto_mode  = states["auto_mode"]
+            dn_state   = states["dn_state"]
             dn_changed = states["dn_changed"]
 
             frame = analysis_cam.capture_frame()
@@ -69,6 +80,14 @@ def main():
                 overall_dark, cell_dark, img = analyzer.analyze(frame)
 
                 if auto_mode:
+                    #messing with this - old version, true auto
+                    #dac = step_and_apply(
+                     #   cell_dark,
+                      #  dac,
+                       # step=C.STEP,
+                        #threshold_dark=dark_cutoff,   # <-- use live-adjustable cutoff
+                        #emergency_mode=emer.emergency
+                    #)
                     dac = pid_step_and_apply(
                         cell_darkness=cell_dark,
                         state=dac,
@@ -78,12 +97,15 @@ def main():
                     )
                 else:
                     if prev_auto_mode in (True, None):
+                        #ANOTHER CHANGE FROM AUTO MODE, NOW WITH PID
+                        #dac = reset_all(dac)
                         dac = reset_all(dac, pid)
                     for k in dac.keys():
                         dac[k] = 0
 
                 draw_analysis(img, dac, auto_mode)
 
+                # HUD: show analyzer threshold (T), mode, active profile, and NEW darkness cutoff (DARK)
                 t_val = analyzer.get_threshold()
                 mode_str = getattr(analyzer, "threshold_mode", "global")
                 cv2.putText(
@@ -110,30 +132,33 @@ def main():
             if hdr_frame is not None:
                 ups = get_ups_data()
                 current_status = ups.get("ups.status", "Unknown")
+                
+                # BEFORE
+				# just_switched_to_auto = (prev_auto_mode is False and auto_mode)
+				# Determine whether AUTO was just switched on
+				# (handles startup case where prev_auto_mode is None)
+				just_switched_to_auto = ((prev_auto_mode is False or prev_auto_mode is None) and auto_mode)
 
-                # Determine whether AUTO was just switched on (handles startup case)
-                just_switched_to_auto = ((prev_auto_mode is False or prev_auto_mode is None) and auto_mode)
+				# Evaluate emergency state transition
+				emergency_mode, event = emer.eval_transition(
+					current_status,
+					auto_mode=auto_mode,
+					just_switched_to_auto=just_switched_to_auto
+				)
 
-                # Evaluate emergency state transition
-                emergency_mode, event = emer.eval_transition(
-                    current_status,
-                    auto_mode=auto_mode,
-                    just_switched_to_auto=just_switched_to_auto
-                )
 
-                # Handle emergency events
+
                 if event == "enter_returned_to_auto":
                     print("Returned to AUTO while UPS is already On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac, pid)
+                    dac = reset_all(dac,pid)
                 elif event == "enter_online_to_onbatt":
                     print("UPS transitioned Online -> On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac, pid)
-                elif event == "enter_boot_on_battery":
-                    print("System booted in AUTO while UPS is On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac, pid)
+                    dac = reset_all(dac,pid)
                 elif event == "exit_online":
                     print("UPS back Online. EXITING EMERGENCY MODE.")
 
+
+                # hdr_show expects keyword args
                 hdr_show(
                     hdr_frame,
                     active_name=active_name,
@@ -142,30 +167,40 @@ def main():
                     emergency_mode=emergency_mode
                 )
 
+            # remember for next loop
             prev_auto_mode = auto_mode
 
+            # --- Key handling ---
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 13, 10):
                 print("Exiting...")
                 try:
-                    dac = reset_all(dac, pid)
+                    dac = reset_all(dac,pid)
                 except Exception:
                     pass
                 break
+
+            # Analyzer threshold (brightness) — global mode only
             elif key == ord('['):
                 analyzer.adjust_threshold(-5)
             elif key == ord(']'):
                 analyzer.adjust_threshold(+5)
+
+            # NEW: Darkness cutoff adjustment (percentage of dark pixels to trigger)
             elif key == ord('-'):
                 dark_cutoff = clamp(dark_cutoff - 2, 0, 100)
                 print(f"[Policy] darkness cutoff → {dark_cutoff}%")
-            elif key in (ord('='), ord('+')):
+            elif key in (ord('='), ord('+')):  # plus key reports '=' on most layouts
                 dark_cutoff = clamp(dark_cutoff + 2, 0, 100)
                 print(f"[Policy] darkness cutoff → {dark_cutoff}%")
+
+            # Toggle global fixed threshold <-> local Otsu per cell
             elif key == ord('\\'):
                 cur = getattr(analyzer, "threshold_mode", "global")
                 new = "local_otsu" if cur == "global" else "global"
                 analyzer.set_threshold_mode(new)
+
+            # Exposure + Profiles
             elif key == ord('e'):
                 if not exposure_locked:
                     if set_exposure_manual(PROFILES[current_profile]["exposure_ms"],
@@ -182,7 +217,8 @@ def main():
 
     finally:
         try:
-            dac = reset_all(dac, pid)
+            #dac = reset_all(dac)
+            dac = reset_all(dac,pid)
         except Exception:
             pass
         try:
@@ -190,13 +226,11 @@ def main():
         except Exception:
             pass
         try:
-            if hdr_cam_primary:
-                hdr_cam_primary.release()
+            if hdr_cam_primary: hdr_cam_primary.release()
         except Exception:
             pass
         try:
-            if hdr_cam_alt:
-                hdr_cam_alt.release()
+            if hdr_cam_alt: hdr_cam_alt.release()
         except Exception:
             pass
         try:

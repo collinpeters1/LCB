@@ -16,7 +16,7 @@
 #
 # Tuning knobs:
 FLOOD_MIN_DAC = 60   # first code where flood is visibly on
-FLOOD_MAX_DAC = 100   # code where flood already looks "full"
+FLOOD_MAX_DAC = 255   # code where flood already looks "full"
 # You can tweak those two numbers on the bench without touching anything else.
 
 # Which lights are "flood behavior" and need mapping?
