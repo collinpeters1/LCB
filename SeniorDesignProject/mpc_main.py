@@ -1,171 +1,308 @@
-
 #!/usr/bin/env python3
-# mpc_main.py
-# Glue that wires the MPC into your Pi loop using your existing camera analysis and overlay,
-# and drives the real DACs over SPI. Drop alongside your current code and run on the Pi.
-#
-# Windows:
-#   • "Analysis (C270)" – your annotated analysis view with per-sector darkness and DAC overlays
-#
-# Controls:
-#   • GPIO 22 (AUTO)     – HIGH => AUTO; LOW => MANUAL (holds last command)
-#   • GPIO 23 (DAY/NIGHT) – Debounced level forwarded to your HDR path if you hook it
-#
-# Requirements:
-#   pip install cvxpy osqp spidev RPi.GPIO opencv-python numpy
-#
-from __future__ import annotations
-import os, time, csv
-import numpy as np
+# SeniorDesignProject/mpc_main.py
+# Same UX as the old main: camera display, HDR switching, overlays, UPS/emergency,
+# threshold hotkeys, exposure profiles... but with MPC in place of PID.
+
 import cv2
+import time
+import numpy as np
+from pathlib import Path
 
-# Local modules (shipped with this file set)
-import mpc_config as CFG
-from mpc_controller import MPCController
-import spi_dac as HW
+from modules import Config as C
+from modules.LightingAnalysis import CameraManager, LightingAnalyzer
+from modules.DualPicam import PicamFeed  # (kept for compatibility; used via HDRView helpers)
+from modules.UPS import get_ups_data
+from modules.ModeSwitches import ModeSwitches
+from modules.OverlayRenderer import draw_analysis
+from modules.HDRView import ensure_active as hdr_ensure_active, capture_frame as hdr_capture_frame, show as hdr_show
+from modules.EmergencyController import EmergencyController
+from modules.ExposureControl import apply_profile, cycle_profile, set_exposure_auto, set_exposure_manual, PROFILES, PROFILE_ORDER
+from modules.mpc_controller import MPCController
 
-# Your existing helpers
-from LightingAnalysis import CameraManager, LightingAnalyzer
-from ModeSwitches import ModeSwitches
-from OverlayRenderer import draw_analysis
+# # add temporarily near top (after imports):
+# from time import sleep
 
-# -------------- Helpers --------------
-def _load_model(paths):
-    last_err = None
-    for p in paths:
-        try:
-            data = np.load(p)
-            A = data["A"]; B = data["B"]
-            return A, B, p
-        except Exception as e:
-            last_err = e
-    raise FileNotFoundError(f"Couldn't load model from {paths}. Last error: {last_err}")
+#def _blink_mapping_once():
+ #   names = ["HF1","HF2","HS11","HS12","HS21","HS22","LF1","LF2","LS1","LS2"]
+  #  vec = np.zeros(10)
+   # for i, n in enumerate(names):
+    #    vec[:] = 0
+     #   vec[i] = 60  # small visible step
+      #  dac_apply_vec(vec)
+       # print("Blink:", n)
+        #sleep(0.4)
+    #dac_zero_all()
 
-def _stack_ref(target: np.ndarray, N: int) -> np.ndarray:
-    # (ny,) -> (ny,N) constant trajectory
-    return np.tile(target.reshape(-1,1), (1, N))
+# then call it once at startup (before the main loop), verify visually, then remove:
+# _blink_mapping_once()
 
-def _open_csv(path, header):
-    need_header = not os.path.exists(path)
-    f = open(path, "a", newline="")
-    w = csv.writer(f)
-    if need_header:
-        w.writerow(header)
-    return f, w
 
-# -------------- Main --------------
+
+# --- NEW: MPC controller + DAC I/O ---
+from spi_dac import apply_vec as dac_apply_vec, vec_to_dict as dac_vec_to_dict, zero_all as dac_zero_all
+
+# === IMPORTANT ===
+# Set this list to the EXACT order of the MPC inputs (columns of B).
+# If your artifact differs, edit this to match your mpc_model.npz.
+MODEL_INPUT_NAMES = ["HF1","HF2","HS11","HS12","HS21","HS22","LF1","LF2","LS1","LS2"]
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+# AFTER
+def _build_reference(y_set: float, ny: int, N: int) -> np.ndarray:
+    r1 = np.full((ny,), float(y_set))   # (ny,)
+    return np.tile(r1.reshape(ny, 1), (1, N))  # (ny, N)
+    
 def main():
-    # --- Load model ---
-    A, B, model_path = _load_model(CFG.MODEL_PATHS)
-    ny, nu = B.shape
-    if ny != 6 or nu != 10:
-        raise ValueError(f"Model must be 6x10 (ny,nu) = (6,10), got {B.shape}")
-    print(f"[MPC] Loaded model from {model_path} (A{A.shape}, B{B.shape})")
+    # ---------- Hardware switches & cameras (unchanged behavior) ----------
+    switches = ModeSwitches(auto_pin=C.AUTO_PIN, dn_pin=C.DN_PIN, dn_debounce_ms=C.DN_DEBOUNCE_MS)
+    analysis_cam = CameraManager(camera_index=C.ANALYSIS_CAMERA_INDEX)
 
-    # --- Build controller ---
+    active_name = C.HDR_DAY_NAME
+    hdr_cam_primary = None
+    hdr_cam_alt = None
+
+    analyzer = LightingAnalyzer(threshold_value=C.THRESHOLD_DARK, rows=3, cols=2)
+
+    emer = EmergencyController()
+    prev_auto_mode = None  # track for just_switched_to_auto
+
+    dark_cutoff = int(clamp(C.THRESHOLD_DARK, 0, 100))  # percent 0..100
+
+    current_profile = PROFILE_ORDER[0]
+    apply_profile(current_profile, analyzer)
+    exposure_locked = (PROFILES[current_profile]["exposure"] == "manual")
+
+    dn_state_initial, _ = switches.read_dn_debounced()
+    last_dn_high = dn_state_initial
+    desired_active = C.HDR_DAY_NAME if last_dn_high else C.HDR_NIGHT_NAME
+    active_name, hdr_cam_primary, hdr_cam_alt = hdr_ensure_active(
+        desired_active, active_name, hdr_cam_primary, hdr_cam_alt, settle_s=C.SWITCH_SETTLE_S
+    )
+    switch_in_progress = False
+
+    # ---------- NEW: MPC setup ----------
+    model_path = Path(__file__).parent / "build" / "mpc_model.npz"
+    if not model_path.exists():
+        raise FileNotFoundError(f"[MPC] Model file missing: {model_path}")
+    data = np.load(model_path, allow_pickle=True)
+    A, B = data["A"], data["B"]
+    Ts = float(data.get("Ts", C.LOOP_SLEEP_S if C.LOOP_SLEEP_S > 0 else 0.05))
+    ny, nu = A.shape[0], B.shape[1]
+    assert ny == 6, f"[MPC] Expected 6 outputs (S11..S32); got ny={ny}"
+    assert nu == len(MODEL_INPUT_NAMES), f"[MPC] B has {nu} cols but MODEL_INPUT_NAMES has {len(MODEL_INPUT_NAMES)}"
+
+    # Tunings (start conservative; adjust after first live test)
+    N  = 5                       # horizon
+    Qd = np.ones(ny) * 5.0       # output tracking weights
+    Rd = np.ones(nu) * 0.1       # control effort weights
+    u_min = np.zeros(nu)
+    u_max = np.ones(nu) * 255.0
+    du_max = 8.0                 # DAC code slew per step
     mpc = MPCController(
         A, B,
-        N=CFG.N_HORIZON,
-        Q_diag=CFG.Q_TRACK,
-        R_diag=CFG.R_USE,
-        u_min=CFG.U_MIN,
-        u_max=CFG.U_MAX,
-        du_max=CFG.DU_MAX,
-        lam=CFG.LAMBDA_LINEAR,
-        p_coeffs=CFG.P_COEFFS,
-        P_max=CFG.P_MAX,
-        slack_penalty=1e6,
+        N=N, Q_diag=Qd, R_diag=Rd,
+        u_min=u_min, u_max=u_max,
+        du_max=du_max,
+        lam=0.0,
+        p_coeffs=None, P_max=None,
+        slack_penalty=1e6
     )
-    last_u = np.zeros(nu, dtype=float)
 
-    # --- Camera + analysis ---
-    cam = CameraManager(camera_index=0)  # uses V4L2 UVC (OV9281) in your project
-    analyzer = LightingAnalyzer(threshold_value=int(CFG.TARGET_PER_SECTOR.mean()), rows=3, cols=2)
+    # Reference built from the analyzer threshold (same semantics as old main)
+    y_set = float(dark_cutoff)
+    r_traj = _build_reference(y_set, ny, N)
+    u_prev = np.zeros(nu)  # last MPC command vector (nu=10)
 
-    # --- GPIO mode switches ---
-    switches = ModeSwitches()
+    # We'll maintain a 'dac' dict for overlay compatibility (same as old main)
+    dac_dict = {name: 0 for name in MODEL_INPUT_NAMES}
 
-    # --- Logging (heartbeat) ---
-    hb_file = None; hb_writer = None
-    if CFG.HEARTBEAT_CSV:
-        hb_file, hb_writer = _open_csv(CFG.HEARTBEAT_CSV,
-            ["t_s","status","solve_ms","cost"] +
-            [f"y_{s}" for s in ["S11","S12","S21","S22","S31","S32"]] +
-            HW.NAMES
-        )
+    print("Starting multi-light control (MPC).")
+    print("Hotkeys: q=quit  [ ]=brightness threshold  -=/+= darkness cutoff  \\=global/local-Otsu  E=exposure  P=profile")
 
-    # --- Windows ---
-    if CFG.SHOW_WINDOWS:
-        cv2.namedWindow("Analysis (C270)", cv2.WINDOW_NORMAL)
-
-    print("[MPC] Starting control loop. Press 'q' to quit.")
     try:
         while True:
-            ret, frame = cam.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-
-            # Per-sector darkness and annotated image
-            overall_dark, cell_dark, annotated = analyzer.analyze(frame)
-            y = np.array(cell_dark, dtype=float).reshape(6)
-
-            # Mode switches
             states = switches.read_states()
-            auto_mode = bool(states["auto_mode"])  # HIGH => AUTO
+            auto_mode = states["auto_mode"]
+            dn_state = states["dn_state"]
+            dn_changed = states["dn_changed"]
 
-            # Prepare MPC parameters
-            r_traj = _stack_ref(CFG.TARGET_PER_SECTOR, CFG.N_HORIZON)
-
-            # Solve / hold depending on AUTO/MANUAL
-            if auto_mode:
-                u_cmd, status, solve_ms, cost = mpc.compute(y0=y, r_traj=r_traj, u_prev=last_u)
+            # ---- Analysis frame & darkness measurement (unchanged) ----
+            frame = analysis_cam.capture_frame()
+            if frame is not None:
+                overall_dark, cell_dark, img = analyzer.analyze(frame)  # cell_dark order: [S11,S12,S21,S22,S31,S32]
+                y_k = np.asarray(cell_dark, dtype=float)                # <- MPC output vector (ny=6)
             else:
-                u_cmd, status, solve_ms, cost = last_u.copy(), "manual_hold", 0.0, None
+                img = None
+                y_k = np.zeros(ny, dtype=float)
 
-            # Apply to hardware
-            HW.apply_vec(u_cmd)
-            last_u = u_cmd
+            # ---- Control law: MPC (replaces PID) ----
+            if auto_mode and not emer.emergency:
+                # Solve MPC for new command vector
+                u_cmd, status, solve_ms, cost_val = mpc.compute(y0=y_k, u_prev=u_prev, r_traj=r_traj)
 
-            # Overlay: DACs and mode
-            dac_dict = HW.vec_to_dict(u_cmd)
-            annotated = draw_analysis(annotated, dac_dict, auto_mode)
+                # Clamp and write to DACs in the physical/driver order expected by spi_dac
+                # Here we assume spi_dac uses the same order as MODEL_INPUT_NAMES; if not,
+                # re-order u_cmd into spi order before apply_vec.
+                u_cmd = np.clip(u_cmd, 0, 255)
 
-            if CFG.SHOW_WINDOWS:
-                cv2.imshow("Analysis (C270)", annotated)
-                k = cv2.waitKey(1) & 0xFF
-                if k in (ord('q'), ord('Q')):
-                    break
+                # Apply to hardware
+                try:
+                    dac_apply_vec(u_cmd)  # writes all 10 channels
+                except Exception as e:
+                    print(f"[SPI] write error: {e}")
 
-            # Heartbeat log
-            if hb_writer:
-                t_s = f"{time.time():.3f}"
-                row = [t_s, status, f"{solve_ms:.2f}", "" if cost is None else f"{cost:.3f}"]                       + [f"{v:.2f}" for v in y.tolist()]                       + [str(int(dac_dict[n])) for n in HW.NAMES]
-                hb_writer.writerow(row)
-                hb_file.flush()
+                # For overlay: convert to dict keyed by light names
+                dac_dict = {name: int(round(val)) for name, val in zip(MODEL_INPUT_NAMES, u_cmd.tolist())}
+                u_prev = u_cmd.copy()
 
-            time.sleep(CFG.SLEEP_S)
+            else:
+                # Manual or emergency: zero outputs (same UX as old main)
+                if prev_auto_mode in (True, None) or emer.emergency:
+                    u_prev[:] = 0.0
+                try:
+                    dac_zero_all()
+                except Exception:
+                    pass
+                for k in dac_dict.keys():
+                    dac_dict[k] = 0
+
+            # ---- Draw overlay (unchanged) ----
+            if img is not None:
+                draw_analysis(img, dac_dict, auto_mode)
+                t_val = analyzer.get_threshold()
+                mode_str = getattr(analyzer, "threshold_mode", "global")
+                cv2.putText(
+                    img,
+                    f"T={t_val}  MODE={mode_str}  DARK={dark_cutoff}%  PROFILE={current_profile}",
+                    (10, img.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2
+                )
+                cv2.imshow(C.WINDOW_ANALYSIS, img)
+
+            # ---- HDR switching (unchanged) ----
+            if not switch_in_progress and dn_changed:
+                switch_in_progress = True
+                desired_active = C.HDR_DAY_NAME if dn_state else C.HDR_NIGHT_NAME
+                active_name, hdr_cam_primary, hdr_cam_alt = hdr_ensure_active(
+                    desired_active, active_name, hdr_cam_primary, hdr_cam_alt, settle_s=C.SWITCH_SETTLE_S
+                )
+                last_dn_high = dn_state
+                time.sleep(C.SWITCH_SETTLE_S)
+                switch_in_progress = False
+
+            hdr_src = hdr_cam_primary if active_name == C.HDR_DAY_NAME else hdr_cam_alt
+            hdr_frame = hdr_capture_frame(hdr_src)
+            if hdr_frame is not None:
+                ups = get_ups_data()
+                current_status = ups.get("ups.status", "Unknown")
+
+                # Determine whether AUTO was just switched on (handles startup case)
+                just_switched_to_auto = ((prev_auto_mode is False or prev_auto_mode is None) and auto_mode)
+
+                # Evaluate emergency state transition (unchanged)
+                emergency_mode, event = emer.eval_transition(
+                    current_status,
+                    auto_mode=auto_mode,
+                    just_switched_to_auto=just_switched_to_auto
+                )
+
+                # Handle emergency events (unchanged messaging/behavior)
+                if event == "enter_returned_to_auto":
+                    print("Returned to AUTO while UPS is already On Battery. ENTERING EMERGENCY MODE.")
+                    u_prev[:] = 0.0
+                elif event == "enter_online_to_onbatt":
+                    print("UPS transitioned Online -> On Battery. ENTERING EMERGENCY MODE.")
+                    u_prev[:] = 0.0
+                elif event == "enter_boot_on_battery":
+                    print("System booted in AUTO while UPS is On Battery. ENTERING EMERGENCY MODE.")
+                    u_prev[:] = 0.0
+                elif event == "exit_online":
+                    print("UPS back Online. EXITING EMERGENCY MODE.")
+
+                hdr_show(
+                    hdr_frame,
+                    active_name=active_name,
+                    auto_mode=auto_mode,
+                    ups_data=ups,
+                    emergency_mode=emergency_mode
+                )
+
+            prev_auto_mode = auto_mode
+
+            # ---- Hotkeys (unchanged semantics) ----
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 13, 10):
+                print("Exiting...")
+                try:
+                    dac_zero_all()
+                except Exception:
+                    pass
+                break
+            elif key == ord('['):
+                analyzer.adjust_threshold(-5)
+                # Keep reference aligned with visual threshold semantics
+                y_set = float(analyzer.get_threshold())
+                r_traj = _build_reference(y_set, ny, N)
+            elif key == ord(']'):
+                analyzer.adjust_threshold(+5)
+                y_set = float(analyzer.get_threshold())
+                r_traj = _build_reference(y_set, ny, N)
+            elif key == ord('-'):
+                dark_cutoff = clamp(dark_cutoff - 2, 0, 100)
+                print(f"[Policy] darkness cutoff → {dark_cutoff}%")
+                y_set = float(dark_cutoff)
+                r_traj = _build_reference(y_set, ny, N)
+            elif key in (ord('='), ord('+')):
+                dark_cutoff = clamp(dark_cutoff + 2, 0, 100)
+                print(f"[Policy] darkness cutoff → {dark_cutoff}%")
+                y_set = float(dark_cutoff)
+                r_traj = _build_reference(y_set, ny, N)
+            elif key == ord('\\'):
+                cur = getattr(analyzer, "threshold_mode", "global")
+                new = "local_otsu" if cur == "global" else "global"
+                analyzer.set_threshold_mode(new)
+            elif key == ord('e'):
+                if not exposure_locked:
+                    if set_exposure_manual(PROFILES[current_profile]["exposure_ms"],
+                                           PROFILES[current_profile]["gain"]):
+                        exposure_locked = True
+                else:
+                    if set_exposure_auto():
+                        exposure_locked = False
+            elif key == ord('p'):
+                current_profile = cycle_profile(current_profile, analyzer)
+                exposure_locked = (PROFILES[current_profile]["exposure"] == "manual")
+
+            time.sleep(C.LOOP_SLEEP_S)
 
     finally:
+        # ---- Safe shutdown (same UX) ----
         try:
-            HW.zero_all()
+            dac_zero_all()
         except Exception:
             pass
         try:
-            cam.release()
+            analysis_cam.release()
         except Exception:
             pass
         try:
-            if CFG.SHOW_WINDOWS:
-                cv2.destroyAllWindows()
+            if hdr_cam_primary:
+                hdr_cam_primary.release()
         except Exception:
             pass
         try:
-            switches.cleanup()
+            if hdr_cam_alt:
+                hdr_cam_alt.release()
         except Exception:
             pass
-        if hb_file:
-            hb_file.close()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        switches.cleanup()
 
 if __name__ == "__main__":
     main()

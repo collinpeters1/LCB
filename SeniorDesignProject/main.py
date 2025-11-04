@@ -1,37 +1,42 @@
 # main.py
+import os
+import sys
 import cv2
 import time
 import numpy as np
+
+# Ensure local modules are importable when launched via a script
+HERE = os.path.dirname(__file__)
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "modules"))
 
 from modules import Config as C
 from modules.LightingAnalysis import CameraManager, LightingAnalyzer
 from modules.DualPicam import PicamFeed
 from modules.UPS import get_ups_data
 from modules.ModeSwitches import ModeSwitches
-#from modules.LightPolicy import init_state, reset_all, step_and_apply
 
-# --- MODIFIED: We only need the functions and manager from PIDPolicy ---
-# init_state and reset_all are assumed to talk to hardware
+# --- PID POLICY IMPORTS ---
 from modules.PIDPolicy import init_state, reset_all, pid_step_and_apply, PIDManager
-# --- END MODIFIED ---
+# --- END PID POLICY IMPORTS ---
 
 from modules.OverlayRenderer import draw_analysis
 from modules.HDRView import ensure_active as hdr_ensure_active, capture_frame as hdr_capture_frame, show as hdr_show
 from modules.EmergencyController import EmergencyController
 from modules.ExposureControl import apply_profile, cycle_profile, set_exposure_auto, set_exposure_manual, PROFILES, PROFILE_ORDER
 
-# --- NEW MPC IMPORTS ---
-# Make sure mpc_config.py, mpc_controller_fast.py, and spi_dac.py
-# are in the same directory or in your Python path
+# --- MPC IMPORTS (as a package) ---
+# mpc_config.py and mpc_controller_fast.py live in modules/
+# spi_dac.py lives alongside this file (SeniorDesignProject/)
 try:
-    import mpc_config as CFG
-    import mpc_controller_fast as mpc_fast
+    from modules import mpc_config as CFG
+    from modules import mpc_controller_fast as mpc_fast
     import spi_dac as HW
 except ImportError as e:
     print(f"FATAL: Could not import MPC modules. {e}")
-    print("Make sure mpc_config.py, mpc_controller_fast.py, and spi_dac.py are accessible.")
-    exit()
-# --- END NEW MPC IMPORTS ---
+    print("Make sure 'modules/mpc_config.py', 'modules/mpc_controller_fast.py', and 'spi_dac.py' are accessible.")
+    sys.exit(1)
+# --- END MPC IMPORTS ---
 
 
 def clamp(val, lo, hi):
@@ -50,29 +55,32 @@ def main():
     analyzer = LightingAnalyzer(threshold_value=C.THRESHOLD_DARK, rows=3, cols=2)
 
     # --- PID POLICY ---
-    # This init_state() is from your PIDPolicy module.
-    # It is assumed to init hardware and return the state dict.
     dac = init_state()
     pid = PIDManager(
-        kp=1.3, ki = 2.4, kd = 0.05,
-        sample_time = C.LOOP_SLEEP_S/10,
+        kp=1.3, ki=2.4, kd=0.05,
+        sample_time=C.LOOP_SLEEP_S/10,
         slew_per_step=3.0,
         deadband=2.0
     )
     print("PID Sample_time =", next(iter(pid.pids.values())).sample_time)
-    
-    # --- NEW: MPC POLICY INIT ---
+
+    # --- MPC POLICY INIT ---
     try:
-        # Use the loader from mpc_main.py, but simplified to one path
-        model_path = CFG.MODEL_PATHS[0] 
-        model = np.load(model_path)
-        A, B = model['A'], model['B']
+        # Prefer configured path; fall back to ./build/mpc_model.npz
+        model_path = CFG.MODEL_PATHS[0] if getattr(CFG, "MODEL_PATHS", None) else os.path.join(HERE, "build", "mpc_model.npz")
+        if not os.path.isabs(model_path):
+            model_path = os.path.join(HERE, model_path)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(model_path)
+
+        # Load once for logging shapes
+        model_npz = np.load(model_path)
+        A, B = model_npz["A"], model_npz["B"]
         print(f"Loaded MPC model from {model_path}: A={A.shape}, B={B.shape}")
     except Exception as e:
-        print(f"FATAL: Could not load MPC model from {CFG.MODEL_PATHS}. {e}")
-        return # Can't run without a model
+        print(f"FATAL: Could not load MPC model. Tried '{model_path}'. {e}")
+        return
 
-    # Load config from mpc_config.py
     mpc_cfg = mpc_fast.MPCConfig(
         horizon=CFG.N_HORIZON,
         du_max=CFG.DU_MAX,
@@ -84,18 +92,21 @@ def main():
         P_max=CFG.P_MAX,
         p_coeffs=CFG.P_COEFFS
     )
-    mpc = mpc_fast.FastMPC(A, B, mpc_cfg)
-    mpc_last_u = HW.dict_to_vec(dac) # Start MPC state from the zeroed DAC dict
-    
-    # --- NEW: Policy switching state ---
-    control_policy = "PID"  # Start with PID as default
-    # --- END NEW MPC INIT ---
+
+    # IMPORTANT: FastMPC expects model_path, NOT (A, B)
+    mpc = mpc_fast.FastMPC(model_path, mpc_cfg)
+
+    # Start MPC's previous command vector from current DAC dict (safe: no dict_to_vec in driver)
+    mpc_last_u = np.array([dac.get(n, 0) for n in HW.NAMES], dtype=float)
+
+    # --- Policy switching state (default PID; press 'm' to toggle) ---
+    control_policy = "PID"
 
     emer = EmergencyController()
     prev_auto_mode = None  # track for just_switched_to_auto
 
-    # --- NEW: runtime-adjustable darkness cutoff (starts from config) ---
-    dark_cutoff = int(clamp(C.THRESHOLD_DARK, 0, 100))  # percent 0..100
+    # Runtime-adjustable darkness cutoff (percent)
+    dark_cutoff = int(clamp(C.THRESHOLD_DARK, 0, 100))  # 0..100 %
 
     # Start in Classroom profile
     current_profile = PROFILE_ORDER[0]
@@ -125,10 +136,9 @@ def main():
                 overall_dark, cell_dark, img = analyzer.analyze(frame)
 
                 if auto_mode:
-                    
-                    # --- NEW: Policy Switcher ---
+                    # --- Policy Switcher ---
                     if control_policy == "PID":
-                        # --- Run PID Policy ---
+                        # Run PID policy
                         dac = pid_step_and_apply(
                             cell_darkness=cell_dark,
                             state=dac,
@@ -136,50 +146,50 @@ def main():
                             threshold_dark=dark_cutoff,
                             emergency_mode=emer.emergency,
                         )
-                        # Sync MPC state for next loop
-                        mpc_last_u = HW.dict_to_vec(dac)
-                    
-                    else: # control_policy == "MPC"
-                        # --- Run MPC Policy ---
-                        y_k = np.array(cell_dark) # (6,) vector
-                        
-                        # Set reference: 0% darkness (or use dark_cutoff)
-                        # Using 0% as the target (fully lit)
-                        r_target = np.zeros(mpc.ny)
-                        
-                        # Use dark_cutoff as target instead (e.g., 10%)
-                        # r_target = np.full(mpc.ny, dark_cutoff) 
-                        
-                        r_traj = np.tile(r_target, (mpc.N, 1)).T # Shape (6, N)
-                        
-                        # Solve MPC
-                        u_cmd_vec, mpc_hb = mpc.update(
+                        # Keep MPC state in sync with current outputs
+                        mpc_last_u = np.array([dac.get(n, 0) for n in HW.NAMES], dtype=float)
+
+                    else:  # MPC
+                        y_k = np.array(cell_dark, dtype=float)  # 6-vector
+
+                        # Choose target: use your shared per-sector darkness target.
+                        # If you want the cutoff to be the setpoint, uncomment below.
+                        # r_target = np.full(mpc.ny, dark_cutoff, dtype=float)
+                        r_target = np.zeros(mpc.ny, dtype=float)  # 0% darkness (fully lit)
+
+                        # Stack across horizon: shape (ny, N)
+                        r_traj = np.tile(r_target, (mpc.N, 1)).T
+
+                        # Solve MPC (FastMPC.compute)
+                        u_cmd_vec, mpc_hb = mpc.compute(
                             y0=y_k,
                             r_traj=r_traj,
                             u_prev=mpc_last_u
                         )
-                        
-                        # Apply to hardware using spi_dac
-                        HW.apply_vec(u_cmd_vec)
-                        
-                        # Store state for next loop
-                        mpc_last_u = u_cmd_vec
-                        dac = HW.vec_to_dict(u_cmd_vec) # Update dict for UI
-                    # --- END Policy Switcher ---
 
-                else: # Manual Mode
+                        # Apply to hardware
+                        HW.apply_vec(u_cmd_vec)
+
+                        # Update loop state
+                        mpc_last_u = u_cmd_vec
+                        dac = HW.vec_to_dict(u_cmd_vec)
+                    # --- End Policy Switcher ---
+
+                else:
+                    # Manual Mode: if we just left AUTO, reset everything
                     if prev_auto_mode in (True, None):
-                        # Just switched to manual, reset everything
-                        dac = reset_all(dac, pid) # This zeros HW and resets PID
-                        mpc_last_u = np.zeros(mpc.nu) # Reset MPC state
-                    
-                    # This loop is from your original code
-                    for k in dac.keys():
+                        dac = reset_all(dac, pid)
+                        try:
+                            mpc_last_u = np.zeros(mpc.nu, dtype=float)
+                        except Exception:
+                            mpc_last_u = np.zeros(len(HW.NAMES), dtype=float)
+                    # Hold zeros in manual
+                    for k in list(dac.keys()):
                         dac[k] = 0
 
                 draw_analysis(img, dac, auto_mode)
 
-                # HUD: show analyzer threshold (T), mode, active profile, and NEW darkness cutoff (DARK)
+                # HUD: show analyzer threshold (T), mode, active profile, darkness cutoff, policy
                 t_val = analyzer.get_threshold()
                 mode_str = getattr(analyzer, "threshold_mode", "global")
                 cv2.putText(
@@ -218,14 +228,13 @@ def main():
 
                 if event == "enter_returned_to_auto":
                     print("Returned to AUTO while UPS is already On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac,pid)
+                    dac = reset_all(dac, pid)
                 elif event == "enter_online_to_onbatt":
                     print("UPS transitioned Online -> On Battery. ENTERING EMERGENCY MODE.")
-                    dac = reset_all(dac,pid)
+                    dac = reset_all(dac, pid)
                 elif event == "exit_online":
                     print("UPS back Online. EXITING EMERGENCY MODE.")
 
-                # hdr_show expects keyword args
                 hdr_show(
                     hdr_frame,
                     active_name=active_name,
@@ -242,20 +251,20 @@ def main():
             if key in (ord('q'), 13, 10):
                 print("Exiting...")
                 try:
-                    dac = reset_all(dac,pid)
+                    dac = reset_all(dac, pid)
                 except Exception:
                     pass
                 break
-            
-            # --- NEW: Policy Toggle ---
+
+            # Toggle PID/MPC
             elif key == ord('m'):
                 if control_policy == "PID":
                     control_policy = "MPC"
-                    # Sync MPC state to current PID output
-                    mpc_last_u = HW.dict_to_vec(dac)
+                    # Sync MPC state to current PID outputs
+                    mpc_last_u = np.array([dac.get(n, 0) for n in HW.NAMES], dtype=float)
                 else:
                     control_policy = "PID"
-                    pid.reset_all() # Reset PID integrators
+                    pid.reset_all()  # Reset PID integrators
                 print(f"Switched to {control_policy} control")
 
             # Analyzer threshold (brightness) — global mode only
@@ -264,11 +273,11 @@ def main():
             elif key == ord(']'):
                 analyzer.adjust_threshold(+5)
 
-            # NEW: Darkness cutoff adjustment (percentage of dark pixels to trigger)
+            # Darkness cutoff adjustment (percent)
             elif key == ord('-'):
                 dark_cutoff = clamp(dark_cutoff - 2, 0, 100)
                 print(f"[Policy] darkness cutoff → {dark_cutoff}%")
-            elif key in (ord('='), ord('+')):  # plus key reports '=' on most layouts
+            elif key in (ord('='), ord('+')):
                 dark_cutoff = clamp(dark_cutoff + 2, 0, 100)
                 print(f"[Policy] darkness cutoff → {dark_cutoff}%")
 
@@ -295,8 +304,7 @@ def main():
 
     finally:
         try:
-            # This is your original reset function
-            dac = reset_all(dac,pid) 
+            dac = reset_all(dac, pid)
         except Exception:
             pass
         try:
@@ -304,11 +312,13 @@ def main():
         except Exception:
             pass
         try:
-            if hdr_cam_primary: hdr_cam_primary.release()
+            if hdr_cam_primary:
+                hdr_cam_primary.release()
         except Exception:
             pass
         try:
-            if hdr_cam_alt: hdr_cam_alt.release()
+            if hdr_cam_alt:
+                hdr_cam_alt.release()
         except Exception:
             pass
         try:
